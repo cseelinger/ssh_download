@@ -13,7 +13,7 @@ BASE="http://127.0.0.1:${LOCAL_PORT}/fhir"
 # FHIR-Identifier-Filter (auf DocumentReference!)
 IDENT_SYSTEM="http://medizininformatik-initiative.de/sid/project-identifier"
 
-# Prefix genau wie in deinem Einzeiler (Standard mit Unterstrich), per Env überschreibbar
+# Präfix für masterIdentifier.value (Standard mit Unterstrich), per Env überschreibbar
 SEARCH_PREFIX="${SEARCH_PREFIX:-NCT-DKFZ-DE_}"
 IDENT_VALUE_EXACT="${IDENT_VALUE_EXACT:-}"
 
@@ -57,6 +57,22 @@ safe_project(){
   tr -cd 'A-Za-z0-9._-'
 }
 
+# SHA-256 einer Datei berechnen – lowercase Hex wie Python hexdigest()
+compute_sha256(){
+  local f="$1" sum=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    sum="$(sha256sum "$f" | awk '{print tolower($1)}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    sum="$(shasum -a 256 "$f" | awk '{print tolower($1)}')"
+  elif command -v openssl >/dev/null 2>&1; then
+    sum="$(openssl dgst -sha256 -r "$f" | awk '{print tolower($1)}')"
+  else
+    echo ""
+    return 1
+  fi
+  echo "$sum"
+}
+
 next_url(){
   local resp="$1" nxt
   nxt="$(jq -r '.link[]? | select(.relation=="next") | .url // empty' "$resp")"
@@ -67,7 +83,9 @@ next_url(){
 fetch_rel(){
   # $1: rel (Binary/…)
   # $2: project (kann leer sein)
-  local rel="$1" project="${2:-}" rel_nover id tmpzip got=0 destdir safe_proj zip_path
+  # $3: expected_hash (kann leer sein)
+  local rel="$1" project="${2:-}" expected_hash="${3:-}"
+  local rel_nover id tmpzip got=0 destdir safe_proj zip_path unpack_dir marker
 
   rel="${rel#/}"
   rel_nover="$(printf '%s' "$rel" | strip_history)"
@@ -76,7 +94,7 @@ fetch_rel(){
   [ -z "$id" ] && id="$(printf '%s' "$rel" | sed -nE 's#^.*/([^/]+)/_history/.*$#\1#p')"
   [ -z "$id" ] && id="$(printf '%s' "$rel_nover" | sed -nE 's#.*/([^/]+)$#\1#p')"
 
-  # --- Zielordner/Datei früh bestimmen (wichtig für den State-Check) ---
+  # Zielpfade
   if [ -n "$project" ]; then
     safe_proj="$(printf '%s' "$project" | tr -cd 'A-Za-z0-9._-')"
     [ -z "$safe_proj" ] && safe_proj="UNKNOWN"
@@ -86,12 +104,10 @@ fetch_rel(){
   fi
   mkdir -p "$destdir"
   zip_path="${destdir}/${id}.zip"
-  # Heuristik: entpackter Ordner heißt wie die ZIP ohne .zip -> also "<destdir>/<id>"
   unpack_dir="${destdir}/${id}"
-  # Optionaler Marker, falls dein Entpacker sowas anlegt:
   marker="${zip_path}.done"
 
-  # --- State-Check + Dateisystem-Realität ---
+  # State/Heuristiken
   if grep -qx "$id" "$STATE"; then
     if [ -f "$zip_path" ]; then
       log "INFO" "skip $id (bereits geladen; ZIP vorhanden: $(basename "$zip_path"))"
@@ -101,7 +117,6 @@ fetch_rel(){
       log "INFO" "skip $id (ZIP fehlt, aber entpackt vorhanden: $(basename "$unpack_dir") oder Marker)"
       return 0
     fi
-    # ZIP fehlt und kein entpackter Ordner/Marker -> neu laden
     log "INFO" "Re-Download: $id (ZIP und entpackter Ordner/Marker fehlen)"
   fi
 
@@ -142,6 +157,31 @@ fetch_rel(){
     return 1
   fi
 
+  # === SHA-256 Check (falls erwarteter Hash vorhanden und Tool verfügbar) ===
+  if [ -n "$expected_hash" ]; then
+    exp="$(printf '%s' "$expected_hash" | tr '[:upper:]' '[:lower:]')"
+    have_hash_tool=0
+    if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || command -v openssl >/dev/null 2>&1; then
+      have_hash_tool=1
+    fi
+    if [ "$have_hash_tool" -eq 1 ]; then
+      act="$(compute_sha256 "$tmpzip")"
+      if [ -n "$act" ]; then
+        if [ "$act" = "$exp" ]; then
+          log "INFO" "SHA256 OK (ID=$id, project=${project:-''}): $act"
+        else
+          log "WARN" "SHA256 MISMATCH (ID=$id): expected=$exp got=$act"
+        fi
+      else
+        log "WARN" "SHA256 konnte nicht berechnet werden (ID=$id)"
+      fi
+    else
+      log "WARN" "Kein SHA256-Tool verfügbar – Check übersprungen (ID=$id, expected=$expected_hash)"
+    fi
+  else
+    log "INFO" "Kein expected Hash im masterIdentifier – Check übersprungen (ID=$id)"
+  fi
+
   mv "$tmpzip" "$zip_path"
   echo "$id" >> "$STATE"
   log "SUCCESS" "gespeichert: ${zip_path}"
@@ -155,6 +195,16 @@ mkdir -p "$OUTDIR"
 touch "$STATE"
 
 need_bin curl; need_bin jq; need_bin base64; need_bin ssh; need_bin sed; need_bin awk; need_bin lsof
+
+if command -v sha256sum >/dev/null 2>&1; then
+  log "INFO" "SHA256-Prüfung via sha256sum aktiv"
+elif command -v shasum >/dev/null 2>&1; then
+  log "INFO" "SHA256-Prüfung via shasum aktiv"
+elif command -v openssl >/dev/null 2>&1; then
+  log "INFO" "SHA256-Prüfung via openssl aktiv"
+else
+  log "WARN" "Kein Tool für SHA256 gefunden (sha256sum/shasum/openssl) – Hash-Check wird übersprungen"
+fi
 
 CLIENT_EXACT=""
 if [ -z "${SEARCH_PREFIX}" ] && [ -n "${IDENT_VALUE_EXACT}" ]; then
@@ -222,12 +272,12 @@ fi
 ############################
 # Kandidaten sammeln (nur DocumentReference)
 ############################
-RELS=()   # Elemente: "PROJECT|||URL"
+RELS=()   # Elemente: "PROJECT|||URL|||HASH"
 TMP="$(mktemp_tmp)"
 found_pages=0
 found_urls=0
 
-# (A) Exakt (falls gesetzt) – inkl. DR-Read-Fallback; Project aus masterIdentifier.value abgeleitet
+# (A) Exakt (falls gesetzt) – inkl. DR-Read-Fallback; Project + Hash aus masterIdentifier.value
 if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
   URL="${BASE}/DocumentReference?identifier=$(printf '%s' "$IDENT_SYSTEM" | sed 's/|/%7C/g')%7C$(printf '%s' "$IDENT_VALUE_EXACT" | sed 's/|/%7C/g')&_count=200"
   while [ -n "$URL" ] && [ $found_pages -lt $MAX_PAGES ]; do
@@ -240,22 +290,30 @@ if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
     ids="$(jq -r '.entry[]?.resource?.id // empty' "$TMP" | awk 'NF')"
     [ -n "$ids" ] && log "INFO" "Treffer-DR IDs (exakt): $(echo "$ids" | xargs)"
 
+    # WICHTIG: Keine 'as $arr' Bindung innerhalb der if-Zweige -> jq 1.5 kompatibel
     lines_tsv="$(jq -r --arg p "$SEARCH_PREFIX" '
-      def proj_from(v; p):
-        if (p|length)>0 then (v // "" | sub("^"+p; "") | split("_")[0])
-        else ((v // "" | split("_"))[1] // "UNKNOWN")
-        end;
+      def proj_hash_from(v; p):
+        ( if (p|length)>0
+          then (v // "" | sub("^"+p; "") | split("_"))
+          else (v // "" | split("_")[1:])
+          end
+        )
+        | if (length>=2) then [.[0], .[length-1]] else ["UNKNOWN",""] end;
+
       .entry[]?.resource as $r
-      | . as $r
       | $r.masterIdentifier.value as $v
-      | [$r.id, proj_from($v; $p), ($r.content[]? | select(.attachment.contentType=="application/zip") | .attachment.url)]
+      | proj_hash_from($v; $p) as $ph
+      | [$r.id,
+         $ph[0],
+         ($r.content[]? | select(.attachment.contentType=="application/zip") | .attachment.url),
+         $ph[1]]
       | select(.[2] != null)
       | @tsv
     ' "$TMP")"
 
     if [ -n "$lines_tsv" ]; then
-      while IFS=$'\t' read -r _id _proj _url; do
-        [ -n "${_url:-}" ] && RELS+=("${_proj}|||${_url}") && found_urls=$((found_urls+1))
+      while IFS=$'\t' read -r _id _proj _url _hash; do
+        [ -n "${_url:-}" ] && RELS+=("${_proj}|||${_url}|||${_hash}") && found_urls=$((found_urls+1))
       done <<< "$lines_tsv"
       log "INFO" "Seite $found_pages (exakt/zip-only): $(printf '%s\n' "$lines_tsv" | wc -l | awk '{print $1}') URLs"
     else
@@ -269,15 +327,29 @@ if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
         [ -z "$drid" ] && continue
         DR_ONE="$(mktemp_dr)"
         if curl_json "${BASE}/DocumentReference/${drid}" -o "$DR_ONE"; then
-          proj="$(jq -r --arg p "$SEARCH_PREFIX" '
-            def proj_from(v; p):
-              if (p|length)>0 then (v // "" | sub("^"+p; "") | split("_")[0])
-              else ((v // "" | split("_"))[1] // "UNKNOWN")
-              end;
-            .masterIdentifier.value as $v | proj_from($v; $p)
+          tsv="$(jq -r --arg p "$SEARCH_PREFIX" '
+            def proj_hash_from(v; p):
+              ( if (p|length)>0
+                then (v // "" | sub("^"+p; "") | split("_"))
+                else (v // "" | split("_")[1:])
+                end
+              )
+              | if (length>=2) then [.[0], .[length-1]] else ["UNKNOWN",""] end;
+
+            . as $r
+            | $r.masterIdentifier.value as $v
+            | proj_hash_from($v; $p) as $ph
+            | [$ph[0], ($r.content[]? | select(.attachment.contentType=="application/zip") | .attachment.url), $ph[1]]
+            | select(.[1] != null)
+            | @tsv
           ' "$DR_ONE")"
-          binu="$(jq -r '(.content[]? | select(.attachment.contentType=="application/zip") | .attachment.url) // empty' "$DR_ONE")"
-          if [ -n "$binu" ]; then RELS+=("${proj}|||${binu}"); found_urls=$((found_urls+1)); log "INFO" "DR ${drid}: URL gefunden"; else log "WARN" "DR ${drid}: keine ZIP-URL"; fi
+          if [ -n "$tsv" ]; then
+            IFS=$'\t' read -r _proj _url _hash <<< "$tsv"
+            RELS+=("${_proj}|||${_url}|||${_hash}"); found_urls=$((found_urls+1))
+            log "INFO" "DR ${drid}: URL+Hash gefunden"
+          else
+            log "WARN" "DR ${drid}: keine ZIP-URL"
+          fi
         else
           log "WARN" "DR ${drid}: Read fehlgeschlagen"
         fi
@@ -289,7 +361,7 @@ if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
   done
 fi
 
-# (B) Vollscan: startswith(SEARCH_PREFIX) + ZIP-URL; Project aus masterIdentifier.value
+# (B) Vollscan: startswith(SEARCH_PREFIX) + ZIP-URL; Project + Hash aus masterIdentifier.value
 URL="${BASE}/DocumentReference?_count=200"
 while [ -n "$URL" ] && [ $found_pages -lt $MAX_PAGES ]; do
   log "INFO" "DR-Seite laden: $URL"
@@ -300,15 +372,22 @@ while [ -n "$URL" ] && [ $found_pages -lt $MAX_PAGES ]; do
   mi_total=$(jq -r '.entry[]?.resource.masterIdentifier // empty' "$TMP" | wc -l | awk '{print $1}')
 
   lines_tsv="$(jq -r --arg p "$PREF" '
-    def proj_from(v; p):
-      if (p|length)>0 then (v // "" | sub("^"+p; "") | split("_")[0])
-      else ((v // "" | split("_"))[1] // "UNKNOWN")
-      end;
+    def proj_hash_from(v; p):
+      ( if (p|length)>0
+        then (v // "" | sub("^"+p; "") | split("_"))
+        else (v // "" | split("_")[1:])
+        end
+      )
+      | if (length>=2) then [.[0], .[length-1]] else ["UNKNOWN",""] end;
+
     .entry[]?.resource as $r
     | select( (($r.masterIdentifier.value // "") | startswith($p)) )
+    | $r.masterIdentifier.value as $v
+    | proj_hash_from($v; $p) as $ph
     | [$r.id,
-       proj_from($r.masterIdentifier.value; $p),
-       ($r.content[]? | select(.attachment.contentType=="application/zip") | .attachment.url)]
+       $ph[0],
+       ($r.content[]? | select(.attachment.contentType=="application/zip") | .attachment.url),
+       $ph[1]]
     | select(.[2] != null)
     | @tsv
   ' "$TMP")"
@@ -316,8 +395,8 @@ while [ -n "$URL" ] && [ $found_pages -lt $MAX_PAGES ]; do
   if [ -n "$lines_tsv" ]; then
     match_ids="$(printf '%s\n' "$lines_tsv" | cut -f1 | sort -u | xargs)"
     [ -n "$match_ids" ] && log "INFO" "Treffer-DRs (prefix/zip-only): $match_ids"
-    while IFS=$'\t' read -r _id _proj _url; do
-      [ -n "${_url:-}" ] && RELS+=("${_proj}|||${_url}") && found_urls=$((found_urls+1))
+    while IFS=$'\t' read -r _id _proj _url _hash; do
+      [ -n "${_url:-}" ] && RELS+=("${_proj}|||${_url}|||${_hash}") && found_urls=$((found_urls+1))
     done <<< "$lines_tsv"
     page_keep=$(printf '%s\n' "$lines_tsv" | wc -l | awk '{print $1}')
   else
@@ -328,7 +407,7 @@ while [ -n "$URL" ] && [ $found_pages -lt $MAX_PAGES ]; do
   URL="$(next_url "$TMP")"
 done
 
-# Deduplizieren (nach kompletter Zeichenkette; URL kann absolut/relativ sein – egal)
+# Deduplizieren (ganze Triple-Zeile)
 if [ "${#RELS[@]}" -eq 0 ]; then
   log "WARN" "keine Kandidaten gefunden (pages=$found_pages, urls=$found_urls)"
   exit 0
@@ -339,17 +418,22 @@ else
 fi
 
 ############################
-# Download (mit Projekt-Unterordner)
+# Download (mit Projekt-Unterordner + Hash-Check)
 ############################
 for entry in "${RELS[@]}"; do
   project="${entry%%|||*}"
-  rel="${entry#*|||}"
+  rest="${entry#*|||}"
+  rel="${rest%%|||*}"
+  expected_hash="${rest#*|||}"
+  # Falls kein drittes Feld vorhanden war:
+  if [ "$expected_hash" = "$rest" ]; then expected_hash=""; fi
+
   case "$rel" in
     Binary/*|Binary/*/_history/*)
-      fetch_rel "$rel" "$project"
+      fetch_rel "$rel" "$project" "$expected_hash"
       ;;
     http*|https*)
-      fetch_rel "$(printf '%s' "$rel" | normalize_rel)" "$project"
+      fetch_rel "$(printf '%s' "$rel" | normalize_rel)" "$project" "$expected_hash"
       ;;
     DocumentReference/*)
       DR_ONE="$(mktemp_dr)"
@@ -358,10 +442,27 @@ for entry in "${RELS[@]}"; do
         log "WARN" "DR-Version nicht lesbar, versuche ohne _history"
         if ! curl_json "${BASE}/${rel_nover}" -o "$DR_ONE"; then log "ERROR" "DR fehlgeschlagen: $rel"; rm -f "$DR_ONE"; continue; fi
       fi
-      binu="$(jq -r '(.content[]? | select(.attachment.contentType=="application/zip") | .attachment.url) // empty' "$DR_ONE")"
+      tsv="$(jq -r --arg p "$SEARCH_PREFIX" '
+        def proj_hash_from(v; p):
+          ( if (p|length)>0
+            then (v // "" | sub("^"+p; "") | split("_"))
+            else (v // "" | split("_")[1:])
+            end
+          )
+          | if (length>=2) then [.[0], .[length-1]] else ["UNKNOWN",""] end;
+        . as $r
+        | $r.masterIdentifier.value as $v
+        | proj_hash_from($v; $p) as $ph
+        | [$ph[0], ($r.content[]? | select(.attachment.contentType=="application/zip") | .attachment.url), $ph[1]]
+        | select(.[1] != null)
+        | @tsv
+      ' "$DR_ONE")"
       rm -f "$DR_ONE"
-      if [ -z "$binu" ]; then log "WARN" "DR ohne ZIP-URL: $rel"; continue; fi
-      fetch_rel "$(printf '%s' "$binu" | normalize_rel)" "$project"
+      if [ -z "$tsv" ]; then log "WARN" "DR ohne ZIP-URL: $rel"; continue; fi
+      IFS=$'\t' read -r proj2 binu hash2 <<< "$tsv"
+      [ -z "$project" ] && project="$proj2"
+      [ -z "$expected_hash" ] && expected_hash="$hash2"
+      fetch_rel "$(printf '%s' "$binu" | normalize_rel)" "$project" "$expected_hash"
       ;;
     *)
       log "WARN" "unbekannter REL-Typ: $rel"
