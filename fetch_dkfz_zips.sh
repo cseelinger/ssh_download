@@ -13,8 +13,8 @@ BASE="http://127.0.0.1:${LOCAL_PORT}/fhir"
 # FHIR-Identifier-Filter (auf DocumentReference!)
 IDENT_SYSTEM="http://medizininformatik-initiative.de/sid/project-identifier"
 
-# Präfix für masterIdentifier.value (Standard mit Unterstrich), per Env überschreibbar
-SEARCH_PREFIX="${SEARCH_PREFIX:-NCT-DKFZ-DE_}"
+# Präfix für masterIdentifier.value (mit Unterstrich-Abschluss)
+: "${SEARCH_PREFIX:=NCT-DKFZ-DE_}"
 IDENT_VALUE_EXACT="${IDENT_VALUE_EXACT:-}"
 
 RELAXED_MATCH=1
@@ -34,7 +34,20 @@ MAX_PAGES=50
 ############################
 # Hilfsfunktionen
 ############################
-ts(){ if date -Iseconds >/dev/null 2>&1; then date -Iseconds; else d="$(date "+%Y-%m-%dT%H:%M:%S%z")"; printf '%s\n' "$d" | sed -E 's/([+-][0-9]{2})([0-9]{2})$/\1:\2/'; fi; }
+# Farben (ANSI)
+GREEN=$'\033[32m'
+RED=$'\033[31m'
+YELLOW=$'\033[33m'
+NC=$'\033[0m'
+
+ts(){
+  if date -Iseconds >/dev/null 2>&1; then
+    date -Iseconds
+  else
+    d="$(date "+%Y-%m-%dT%H:%M:%S%z")"
+    printf '%s\n' "$d" | sed -E 's/([+-][0-9]{2})([0-9]{2})$/\1:\2/'
+  fi
+}
 log(){ echo "$(ts) [$1] $2" | tee -a "$LOG"; }
 die(){ log "ERROR" "$1"; exit 1; }
 need_bin(){ command -v "$1" >/dev/null 2>&1 || die "fehlendes Programm: $1"; }
@@ -53,11 +66,10 @@ normalize_rel(){ sed -E 's#^https?://[^/]+/fhir/##' | sed -E 's#^/##'; }
 strip_history(){ sed -E 's#/_history/[^/]+$##'; }
 
 safe_project(){
-  # nur A-Z a-z 0-9 . _ -
   tr -cd 'A-Za-z0-9._-'
 }
 
-# SHA-256 einer Datei berechnen – lowercase Hex wie Python hexdigest()
+# SHA-256 einer Datei berechnen – lowercase Hex (wie Python hexdigest())
 compute_sha256(){
   local f="$1" sum=""
   if command -v sha256sum >/dev/null 2>&1; then
@@ -168,9 +180,9 @@ fetch_rel(){
       act="$(compute_sha256 "$tmpzip")"
       if [ -n "$act" ]; then
         if [ "$act" = "$exp" ]; then
-          log "INFO" "SHA256 OK (ID=$id, project=${project:-''}): $act"
+          log "INFO" "${GREEN}SHA256 OK (ID=$id, project=${project:-''}): $act${NC}"
         else
-          log "WARN" "SHA256 MISMATCH (ID=$id): expected=$exp got=$act"
+          log "WARN" "${RED}SHA256 MISMATCH (ID=$id): expected=$exp got=$act${NC}"
         fi
       else
         log "WARN" "SHA256 konnte nicht berechnet werden (ID=$id)"
@@ -212,7 +224,7 @@ if [ -z "${SEARCH_PREFIX}" ] && [ -n "${IDENT_VALUE_EXACT}" ]; then
 fi
 
 log "INFO" "Start; Ziel: $OUTDIR, State: $STATE"
-log "INFO" "Filter: system=$IDENT_SYSTEM | prefix=${SEARCH_PREFIX:-<leer>} | exact='${IDENT_VALUE_EXACT:-}'"
+log "INFO" "Filter: system=$IDENT_SYSTEM | prefix=$SEARCH_PREFIX | exact='${IDENT_VALUE_EXACT:-}'"
 
 ############################
 # Lock + Cleanup
@@ -290,7 +302,6 @@ if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
     ids="$(jq -r '.entry[]?.resource?.id // empty' "$TMP" | awk 'NF')"
     [ -n "$ids" ] && log "INFO" "Treffer-DR IDs (exakt): $(echo "$ids" | xargs)"
 
-    # WICHTIG: Keine 'as $arr' Bindung innerhalb der if-Zweige -> jq 1.5 kompatibel
     lines_tsv="$(jq -r --arg p "$SEARCH_PREFIX" '
       def proj_hash_from(v; p):
         ( if (p|length)>0
@@ -425,7 +436,6 @@ for entry in "${RELS[@]}"; do
   rest="${entry#*|||}"
   rel="${rest%%|||*}"
   expected_hash="${rest#*|||}"
-  # Falls kein drittes Feld vorhanden war:
   if [ "$expected_hash" = "$rest" ]; then expected_hash=""; fi
 
   case "$rel" in
