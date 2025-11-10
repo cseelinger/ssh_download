@@ -4,27 +4,23 @@ set -euo pipefail
 ############################
 # Konfiguration
 ############################
-SSH_HOST="dsf-bpe-test"             # SSH-Hostname/IP des BPE-Servers
-SSH_USER="root"                     # SSH-User
-LOCAL_PORT="${LOCAL_PORT:-8089}"    # lokaler Port (per Env übersteuerbar)
-REMOTE_FHIR="10.128.129.159:8080"   # FHIR-Endpunkt (aus Sicht des BPE-Servers)
+SSH_HOST="dsf-bpe-test"
+SSH_USER="root"
+LOCAL_PORT="${LOCAL_PORT:-8089}"
+REMOTE_FHIR="10.128.129.159:8080"
 BASE="http://127.0.0.1:${LOCAL_PORT}/fhir"
 
-# FHIR-Identifier-Filter (auf DocumentReference!)
 IDENT_SYSTEM="http://medizininformatik-initiative.de/sid/project-identifier"
-
-# Präfix für masterIdentifier.value (mit Unterstrich-Abschluss)
 : "${SEARCH_PREFIX:=NCT-DKFZ-DE_}"
 IDENT_VALUE_EXACT="${IDENT_VALUE_EXACT:-}"
 
-RELAXED_MATCH=1
+# Nach Download löschen?
+: "${DELETE_AFTER_DOWNLOAD:=1}"    # 1=an, 0=aus
 
-# Ausgabe & State
 OUTDIR="$HOME/Desktop/celina/DKFZ_Zips"
 STATE="$HOME/.dkfz_fetch_state.txt"
 LOG="/tmp/fetch_dkfz_zips.log"
 
-# Netzwerk/Download-Parameter
 CONNECT_TIMEOUT=5
 MAX_TIME=120
 RETRIES=2
@@ -34,7 +30,6 @@ MAX_PAGES=50
 ############################
 # Hilfsfunktionen
 ############################
-# Farben (ANSI)
 GREEN=$'\033[32m'
 RED=$'\033[31m'
 YELLOW=$'\033[33m'
@@ -65,11 +60,8 @@ curl_bin(){  curl -fS  -L --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_
 normalize_rel(){ sed -E 's#^https?://[^/]+/fhir/##' | sed -E 's#^/##'; }
 strip_history(){ sed -E 's#/_history/[^/]+$##'; }
 
-safe_project(){
-  tr -cd 'A-Za-z0-9._-'
-}
+safe_project(){ tr -cd 'A-Za-z0-9._-'; }
 
-# SHA-256 einer Datei berechnen – lowercase Hex (wie Python hexdigest())
 compute_sha256(){
   local f="$1" sum=""
   if command -v sha256sum >/dev/null 2>&1; then
@@ -92,18 +84,60 @@ next_url(){
   echo "$nxt" | sed -E "s#^https?://[^/]+/fhir#${BASE}#"
 }
 
+# --- HTTP DELETE mit Statusauswertung (idempotent) ---
+_http_delete(){
+  # gibt HTTP-Status zurück
+  curl -sS -o /dev/null -w "%{http_code}" \
+       --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+       -H "Accept: application/fhir+json" \
+       -X DELETE "$1"
+}
+
+_delete_ok(){
+  # 200, 202, 204 = ok; 404/410 = bereits weg → ok
+  case "$1" in
+    200|202|204|404|410) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+fhir_delete_current(){
+  local type="$1" id="$2" url="${BASE}/${type}/${id}"
+  local code; code="$(_http_delete "$url")" || code="$code"
+  if _delete_ok "$code"; then
+    log "INFO" "DELETE ${type}/${id} → $code"
+    return 0
+  else
+    log "ERROR" "DELETE ${type}/${id} fehlgeschlagen (HTTP $code)"
+    return 1
+  fi
+}
+
+fhir_delete_history(){
+  local type="$1" id="$2" url="${BASE}/${type}/${id}/_history"
+  local code; code="$(_http_delete "$url")" || code="$code"
+  # 405/400 könnten bedeuten: Feature nicht aktiviert – dann Warnung
+  if _delete_ok "$code"; then
+    log "INFO" "DELETE ${type}/${id}/_history → $code"
+    return 0
+  else
+    log "WARN" "DELETE ${type}/${id}/_history nicht möglich (HTTP $code)"
+    return 1
+  fi
+}
+
+# --- Download einer Binary-URL + optionales Löschen der zugehörigen Ressourcen ---
 fetch_rel(){
-  # $1: rel (Binary/…)
-  # $2: project (kann leer sein)
-  # $3: expected_hash (kann leer sein)
-  local rel="$1" project="${2:-}" expected_hash="${3:-}"
+  # $1: Binary-REL ("Binary/<id>" oder ".../_history/<vid>")
+  # $2: project
+  # $3: expected_hash (leer möglich)
+  # $4: docref_id (leer möglich)
+  local rel="$1" project="${2:-}" expected_hash="${3:-}" docref_id="${4:-}"
   local rel_nover id tmpzip got=0 destdir safe_proj zip_path unpack_dir marker
 
   rel="${rel#/}"
   rel_nover="$(printf '%s' "$rel" | strip_history)"
-
   id="$(printf '%s' "$rel" | sed -nE 's#^Binary/([^/]+).*$#\1#p')"
-  [ -z "$id" ] && id="$(printf '%s' "$rel" | sed -nE 's#^.*/([^/]+)/_history/.*$#\1#p')"
   [ -z "$id" ] && id="$(printf '%s' "$rel_nover" | sed -nE 's#.*/([^/]+)$#\1#p')"
 
   # Zielpfade
@@ -169,7 +203,7 @@ fetch_rel(){
     return 1
   fi
 
-  # === SHA-256 Check (falls erwarteter Hash vorhanden und Tool verfügbar) ===
+  # SHA-256 Check (optional)
   if [ -n "$expected_hash" ]; then
     exp="$(printf '%s' "$expected_hash" | tr '[:upper:]' '[:lower:]')"
     have_hash_tool=0
@@ -197,6 +231,19 @@ fetch_rel(){
   mv "$tmpzip" "$zip_path"
   echo "$id" >> "$STATE"
   log "SUCCESS" "gespeichert: ${zip_path}"
+
+  # --- Nachlauf: Löschen DocRef & Binary (+ History), falls aktiviert ---
+  if [ "${DELETE_AFTER_DOWNLOAD}" = "1" ]; then
+    # Reihenfolge: erst DocRef, dann Binary (Referenz-Integrität)
+    if [ -n "${docref_id:-}" ]; then
+      fhir_delete_current "DocumentReference" "$docref_id" || true
+      fhir_delete_history "DocumentReference" "$docref_id" || true
+    else
+      log "WARN" "Keine DocRef-ID für Binary ${id} bekannt – überspringe DocRef-DELETE"
+    fi
+    fhir_delete_current "Binary" "$id" || true
+    fhir_delete_history "Binary" "$id" || true
+  fi
 }
 
 ############################
@@ -225,6 +272,7 @@ fi
 
 log "INFO" "Start; Ziel: $OUTDIR, State: $STATE"
 log "INFO" "Filter: system=$IDENT_SYSTEM | prefix=$SEARCH_PREFIX | exact='${IDENT_VALUE_EXACT:-}'"
+log "INFO" "DELETE_AFTER_DOWNLOAD=${DELETE_AFTER_DOWNLOAD}"
 
 ############################
 # Lock + Cleanup
@@ -284,12 +332,13 @@ fi
 ############################
 # Kandidaten sammeln (nur DocumentReference)
 ############################
-RELS=()   # Elemente: "PROJECT|||URL|||HASH"
+# RELS-Element: "PROJECT|||BINARY_URL|||HASH|||DR:<docref-id>"
+RELS=()
 TMP="$(mktemp_tmp)"
 found_pages=0
 found_urls=0
 
-# (A) Exakt (falls gesetzt) – inkl. DR-Read-Fallback; Project + Hash aus masterIdentifier.value
+# (A) Exakt (falls gesetzt)
 if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
   URL="${BASE}/DocumentReference?identifier=$(printf '%s' "$IDENT_SYSTEM" | sed 's/|/%7C/g')%7C$(printf '%s' "$IDENT_VALUE_EXACT" | sed 's/|/%7C/g')&_count=200"
   while [ -n "$URL" ] && [ $found_pages -lt $MAX_PAGES ]; do
@@ -299,9 +348,7 @@ if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
     total="$(jq -r '.total // 0' "$TMP")"
     log "INFO" "Bundle total (exakt): $total"
 
-    ids="$(jq -r '.entry[]?.resource?.id // empty' "$TMP" | awk 'NF')"
-    [ -n "$ids" ] && log "INFO" "Treffer-DR IDs (exakt): $(echo "$ids" | xargs)"
-
+    # dr_id, project, attachment.url, hash
     lines_tsv="$(jq -r --arg p "$SEARCH_PREFIX" '
       def proj_hash_from(v; p):
         ( if (p|length)>0
@@ -323,8 +370,8 @@ if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
     ' "$TMP")"
 
     if [ -n "$lines_tsv" ]; then
-      while IFS=$'\t' read -r _id _proj _url _hash; do
-        [ -n "${_url:-}" ] && RELS+=("${_proj}|||${_url}|||${_hash}") && found_urls=$((found_urls+1))
+      while IFS=$'\t' read -r _drid _proj _url _hash; do
+        [ -n "${_url:-}" ] && RELS+=("${_proj}|||${_url}|||${_hash}|||DR:${_drid}") && found_urls=$((found_urls+1))
       done <<< "$lines_tsv"
       log "INFO" "Seite $found_pages (exakt/zip-only): $(printf '%s\n' "$lines_tsv" | wc -l | awk '{print $1}') URLs"
     else
@@ -332,6 +379,7 @@ if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
     fi
 
     # Fallback: DR-Read pro ID, falls Search-Bundle keine URLs enthielt
+    ids="$(jq -r '.entry[]?.resource?.id // empty' "$TMP" | awk 'NF')"
     if [ -z "$lines_tsv" ] && [ -n "$ids" ]; then
       log "INFO" "Exakt-Suche ohne URLs – lade DRs per ID nach"
       while IFS= read -r drid; do
@@ -356,7 +404,7 @@ if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
           ' "$DR_ONE")"
           if [ -n "$tsv" ]; then
             IFS=$'\t' read -r _proj _url _hash <<< "$tsv"
-            RELS+=("${_proj}|||${_url}|||${_hash}"); found_urls=$((found_urls+1))
+            RELS+=("${_proj}|||${_url}|||${_hash}|||DR:${drid}"); found_urls=$((found_urls+1))
             log "INFO" "DR ${drid}: URL+Hash gefunden"
           else
             log "WARN" "DR ${drid}: keine ZIP-URL"
@@ -372,17 +420,14 @@ if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
   done
 fi
 
-# (B) Vollscan: startswith(SEARCH_PREFIX) + ZIP-URL; Project + Hash aus masterIdentifier.value
+# (B) Vollscan: startswith(SEARCH_PREFIX) + ZIP-URL
 URL="${BASE}/DocumentReference?_count=200"
 while [ -n "$URL" ] && [ $found_pages -lt $MAX_PAGES ]; do
   log "INFO" "DR-Seite laden: $URL"
   if ! curl_json "$URL" -o "$TMP"; then log "ERROR" "DR-Request fehlgeschlagen: $URL"; break; fi
   found_pages=$((found_pages+1))
 
-  PREF="$SEARCH_PREFIX"
-  mi_total=$(jq -r '.entry[]?.resource.masterIdentifier // empty' "$TMP" | wc -l | awk '{print $1}')
-
-  lines_tsv="$(jq -r --arg p "$PREF" '
+  lines_tsv="$(jq -r --arg p "$SEARCH_PREFIX" '
     def proj_hash_from(v; p):
       ( if (p|length)>0
         then (v // "" | sub("^"+p; "") | split("_"))
@@ -404,21 +449,20 @@ while [ -n "$URL" ] && [ $found_pages -lt $MAX_PAGES ]; do
   ' "$TMP")"
 
   if [ -n "$lines_tsv" ]; then
-    match_ids="$(printf '%s\n' "$lines_tsv" | cut -f1 | sort -u | xargs)"
-    [ -n "$match_ids" ] && log "INFO" "Treffer-DRs (prefix/zip-only): $match_ids"
-    while IFS=$'\t' read -r _id _proj _url _hash; do
-      [ -n "${_url:-}" ] && RELS+=("${_proj}|||${_url}|||${_hash}") && found_urls=$((found_urls+1))
+    while IFS=$'\t' read -r _drid _proj _url _hash; do
+      [ -n "${_url:-}" ] && RELS+=("${_proj}|||${_url}|||${_hash}|||DR:${_drid}") && found_urls=$((found_urls+1))
     done <<< "$lines_tsv"
     page_keep=$(printf '%s\n' "$lines_tsv" | wc -l | awk '{print $1}')
   else
     page_keep=0
   fi
 
-  log "INFO" "Seite $found_pages: masterId total=$mi_total | passend=$page_keep (Modus: prefix/zip-only)"
+  mi_total=$(jq -r '.entry[]?.resource.masterIdentifier // empty' "$TMP" | wc -l | awk '{print $1}')
+  log "INFO" "Seite $found_pages: masterId total=$mi_total | passend=$page_keep (prefix/zip-only)"
   URL="$(next_url "$TMP")"
 done
 
-# Deduplizieren (ganze Triple-Zeile)
+# Deduplizieren (ganze Triple+DR-Zeile)
 if [ "${#RELS[@]}" -eq 0 ]; then
   log "WARN" "keine Kandidaten gefunden (pages=$found_pages, urls=$found_urls)"
   exit 0
@@ -429,23 +473,31 @@ else
 fi
 
 ############################
-# Download (mit Projekt-Unterordner + Hash-Check)
+# Download + optionales Delete
 ############################
 for entry in "${RELS[@]}"; do
+  # project|||rel|||hash|||DR:<id>
   project="${entry%%|||*}"
   rest="${entry#*|||}"
   rel="${rest%%|||*}"
-  expected_hash="${rest#*|||}"
-  if [ "$expected_hash" = "$rest" ]; then expected_hash=""; fi
+  rest2="${rest#*|||}"
+  expected_hash="${rest2%%|||*}"
+  meta="${rest2#*|||}"
+  [ "$meta" = "$rest2" ] && meta=""
+  dr_id=""
+  if [[ "$meta" == DR:* ]]; then
+    dr_id="${meta#DR:}"
+  fi
 
   case "$rel" in
     Binary/*|Binary/*/_history/*)
-      fetch_rel "$rel" "$project" "$expected_hash"
+      fetch_rel "$rel" "$project" "$expected_hash" "$dr_id"
       ;;
     http*|https*)
-      fetch_rel "$(printf '%s' "$rel" | normalize_rel)" "$project" "$expected_hash"
+      fetch_rel "$(printf '%s' "$rel" | normalize_rel)" "$project" "$expected_hash" "$dr_id"
       ;;
     DocumentReference/*)
+      # selten – falls manuell eingeschoben
       DR_ONE="$(mktemp_dr)"
       rel_nover="$(printf '%s' "$rel" | strip_history)"
       if ! curl_json "${BASE}/${rel}" -o "$DR_ONE"; then
@@ -467,12 +519,14 @@ for entry in "${RELS[@]}"; do
         | select(.[1] != null)
         | @tsv
       ' "$DR_ONE")"
+      dr_id_alt="$(jq -r '.id // empty' "$DR_ONE")"
       rm -f "$DR_ONE"
       if [ -z "$tsv" ]; then log "WARN" "DR ohne ZIP-URL: $rel"; continue; fi
       IFS=$'\t' read -r proj2 binu hash2 <<< "$tsv"
       [ -z "$project" ] && project="$proj2"
       [ -z "$expected_hash" ] && expected_hash="$hash2"
-      fetch_rel "$(printf '%s' "$binu" | normalize_rel)" "$project" "$expected_hash"
+      [ -z "$dr_id" ] && dr_id="$dr_id_alt"
+      fetch_rel "$(printf '%s' "$binu" | normalize_rel)" "$project" "$expected_hash" "$dr_id"
       ;;
     *)
       log "WARN" "unbekannter REL-Typ: $rel"
