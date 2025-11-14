@@ -52,9 +52,13 @@ mktemp_zip(){ mktemp -t dkfz_zip.XXXXXX; }
 mktemp_tmp(){ mktemp -t dkfz_tmp.XXXXXX; }
 mktemp_dr(){  mktemp -t dkfz_dr.XXXXXX; }
 
-# Mapping DocRef-ID -> masterIdentifier.value für Fehlerlogs
+# Mapping DocRef-ID -> masterIdentifier.value für Fehlerlogs & Routing-Logs
 DRMI_TMP="$(mktemp -t dkfz_drmi.XXXXXX)"
-get_mi_value(){ local id="${1-}"; [ -z "$id" ] && { echo ""; return; }; awk -F $'\t' -v id="$id" '($1==id){print $2; exit}' "$DRMI_TMP" 2>/dev/null || true; }
+get_mi_value(){
+  local id="${1-}"
+  [ -z "$id" ] && { echo ""; return; }
+  awk -F $'\t' -v id="$id" '($1==id){print $2; exit}' "$DRMI_TMP" 2>/dev/null || true
+}
 
 cleanup_all(){
   if [ -S "${CTRL:-}" ]; then ssh -S "$CTRL" -O exit "${SSH_USER}@${SSH_HOST}" >/dev/null 2>&1 || true; fi
@@ -237,7 +241,7 @@ log "INFO" "delete-history beworben: ${HAS_DELETE_HISTORY}"
 ############################
 # Kandidaten sammeln (nur DocumentReference)
 ############################
-# Struktur: "PROJECT|||Binary/<id>|||HASH|||DR:<docref-id>"
+# Struktur: "RECEIVER|||PROJECT|||Binary/<id>|||HASH|||DR:<docref-id>"
 RELS=(); TMP="$(mktemp_tmp)"; found_pages=0; found_urls=0
 
 # (A) Exakt
@@ -251,21 +255,29 @@ if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
     jq -r '.entry[]?.resource | [.id, (.masterIdentifier.value // "")] | @tsv' "$TMP" >> "$DRMI_TMP"
 
     lines_tsv="$(jq -r --arg p "$SEARCH_PREFIX" '
-      def proj_hash_from(v; p):
-        ( if (p|length)>0 then (v // "" | sub("^"+p; "") | split("_")) else (v // "" | split("_")[1:]) end )
-        | if (length>=2) then [.[0], .[length-1]] else ["UNKNOWN",""] end;
+      def proj_receiver_proj_hash(v; p):
+        ( if (p|length)>0
+          then (v // "" | sub("^"+p; "") | split("_"))
+          else (v // "" | split("_")[1:])
+          end
+        ) as $arr
+        | ($arr | length) as $len
+        | if   $len == 3 then [$arr[0], $arr[1], $arr[2]]
+          elif $len == 2 then ["",       $arr[0], $arr[1]]
+          else ["", "UNKNOWN", ""]
+          end;
       .entry[]?.resource as $r
       | $r.masterIdentifier.value as $v
-      | proj_hash_from($v; $p) as $ph
-      | [$r.id, $ph[0], ($r.content[]? | .attachment.url // empty), $ph[1]]
-      | select(.[2] != null)
+      | proj_receiver_proj_hash($v; $p) as $ph
+      | [$r.id, $ph[0], $ph[1], ($r.content[]? | .attachment.url // empty), $ph[2]]
+      | select(.[3] != null)
       | @tsv
     ' "$TMP")"
 
     if [ -n "$lines_tsv" ]; then
-      while IFS=$'\t' read -r _drid _proj _url _hash; do
+      while IFS=$'\t' read -r _drid _recv _proj _url _hash; do
         bid="$(binary_id_from_url "$_url")"
-        [ -n "$bid" ] && RELS+=("${_proj}|||Binary/${bid}|||${_hash}|||DR:${_drid}") && found_urls=$((found_urls+1))
+        [ -n "$bid" ] && RELS+=("${_recv}|||${_proj}|||Binary/${bid}|||${_hash}|||DR:${_drid}") && found_urls=$((found_urls+1))
       done <<< "$lines_tsv"
     fi
     URL="$(next_url "$TMP")"
@@ -282,22 +294,30 @@ while [ -n "$URL" ] && [ $found_pages -lt $MAX_PAGES ]; do
   jq -r '.entry[]?.resource | [.id, (.masterIdentifier.value // "")] | @tsv' "$TMP" >> "$DRMI_TMP"
 
   lines_tsv="$(jq -r --arg p "$SEARCH_PREFIX" '
-    def proj_hash_from(v; p):
-      ( if (p|length)>0 then (v // "" | sub("^"+p; "") | split("_")) else (v // "" | split("_")[1:]) end )
-      | if (length>=2) then [.[0], .[length-1]] else ["UNKNOWN",""] end;
+    def proj_receiver_proj_hash(v; p):
+      ( if (p|length)>0
+        then (v // "" | sub("^"+p; "") | split("_"))
+        else (v // "" | split("_")[1:])
+        end
+      ) as $arr
+      | ($arr | length) as $len
+      | if   $len == 3 then [$arr[0], $arr[1], $arr[2]]
+        elif $len == 2 then ["",       $arr[0], $arr[1]]
+        else ["", "UNKNOWN", ""]
+        end;
     .entry[]?.resource as $r
     | select( (($r.masterIdentifier.value // "") | startswith($p)) )
     | $r.masterIdentifier.value as $v
-    | proj_hash_from($v; $p) as $ph
-    | [$r.id, $ph[0], ($r.content[]? | .attachment.url // empty), $ph[1]]
-    | select(.[2] != null)
+    | proj_receiver_proj_hash($v; $p) as $ph
+    | [$r.id, $ph[0], $ph[1], ($r.content[]? | .attachment.url // empty), $ph[2]]
+    | select(.[3] != null)
     | @tsv
   ' "$TMP")"
 
   if [ -n "$lines_tsv" ]; then
-    while IFS=$'\t' read -r _drid _proj _url _hash; do
+    while IFS=$'\t' read -r _drid _recv _proj _url _hash; do
       bid="$(binary_id_from_url "$_url")"
-      [ -n "$bid" ] && RELS+=("${_proj}|||Binary/${bid}|||${_hash}|||DR:${_drid}") && found_urls=$((found_urls+1))
+      [ -n "$bid" ] && RELS+=("${_recv}|||${_proj}|||Binary/${bid}|||${_hash}|||DR:${_drid}") && found_urls=$((found_urls+1))
     done <<< "$lines_tsv"
   fi
   URL="$(next_url "$TMP")"
@@ -317,22 +337,37 @@ fi
 # Download + optionales Delete
 ############################
 for entry in "${RELS[@]}"; do
-  project="${entry%%|||*}"
+  receiver="${entry%%|||*}"
   rest="${entry#*|||}"
-  rel="${rest%%|||*}"
+  project="${rest%%|||*}"
   rest2="${rest#*|||}"
-  expected_hash="${rest2%%|||*}"
-  meta="${rest2#*|||}"; [ "$meta" = "$rest2" ] && meta=""
+  rel="${rest2%%|||*}"
+  rest3="${rest2#*|||}"
+  expected_hash="${rest3%%|||*}"
+  meta="${rest3#*|||}"; [ "$meta" = "$rest3" ] && meta=""
   dr_id=""; [[ "$meta" == DR:* ]] && dr_id="${meta#DR:}"
 
-  # Zielpfade
+  # Zielpfade: optional Empfänger als Überordner
   if [ -n "$project" ]; then
     safe_proj="$(printf '%s' "$project" | safe_project)"; [ -z "$safe_proj" ] && safe_proj="UNKNOWN"
-    destdir="${OUTDIR}/${safe_proj}"
+    if [ -n "$receiver" ]; then
+      safe_recv="$(printf '%s' "$receiver" | safe_project)"; [ -z "$safe_recv" ] && safe_recv="UNKNOWN_RECEIVER"
+      destdir="${OUTDIR}/${safe_recv}/${safe_proj}"
+    else
+      destdir="${OUTDIR}/${safe_proj}"
+    fi
   else
     destdir="${OUTDIR}"
   fi
   mkdir -p "$destdir"
+
+  # Routing-Log: wie wurde der masterIdentifier aufgelöst?
+  mi_val="$(get_mi_value "$dr_id")"
+  if [ -n "${mi_val:-}" ]; then
+    log "INFO" "Routing: masterIdentifier='${mi_val}' → receiver='${receiver:-}' project='${project:-}' destdir='${destdir}'"
+  else
+    log "INFO" "Routing: masterIdentifier=<unbekannt> → receiver='${receiver:-}' project='${project:-}' destdir='${destdir}'"
+  fi
 
   rel="${rel#/}"; rel_nover="$(printf '%s' "$rel" | strip_history)"
   bid="$(binary_id_from_url "$rel_nover")"
@@ -348,7 +383,7 @@ for entry in "${RELS[@]}"; do
   fi
 
   tmpzip="$(mktemp_zip)"
-  log "INFO" "lade $rel (project=${project:-''})"
+  log "INFO" "lade $rel (receiver=${receiver:-''}, project=${project:-''})"
 
   got=0
   # 1) FHIR-JSON (.data)
