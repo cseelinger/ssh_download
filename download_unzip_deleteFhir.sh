@@ -9,10 +9,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
 
 RUN_DIR="${RUN_DIR:-$SCRIPT_DIR/run}"
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
-OUTDIR="${OUTDIR:-$SCRIPT_DIR/out}"
+OUTDIR="${OUTDIR:-/mnt/OE0600-Projekte/MIC}"
 TMP_DIR="${TMP_DIR:-$SCRIPT_DIR/tmp}"
 
-mkdir -p "$RUN_DIR" "$LOG_DIR" "$OUTDIR" "$TMP_DIR"
+mkdir -p "$RUN_DIR" "$LOG_DIR" "$TMP_DIR"
 
 LOG="${LOG:-$LOG_DIR/download_unzip_deleteFhir.log}"
 : > "$LOG"
@@ -177,7 +177,7 @@ delete_with_verify(){
   while :; do
     code="$(_http_delete "$url")"
     if [ "$code" = "000" ]; then
-      log "WARN" "Transportfehler beim DELETE (kein HTTP-Code) – URL=$url"
+      log "WARN" "Transportfehler beim DELETE (kein HTTP-Code) - URL=$url"
     else
       log "INFO" "DELETE ${rtype}/${rid} → $code"
     fi
@@ -203,7 +203,7 @@ fhir_delete_history(){
     return 1
   fi
   if [ "${HAS_DELETE_HISTORY:-0}" != "1" ] && [ "${FORCE_HISTORY_DELETE}" != "1" ]; then
-    log "INFO" "History-Delete nicht beworben – übersprungen für ${rtype}/${rid}"
+    log "INFO" "History-Delete nicht beworben - übersprungen für ${rtype}/${rid}"
     return 0
   fi
   local url="${BASE}/${rtype}/${rid}/_history"
@@ -222,8 +222,16 @@ fhir_delete_history(){
 cleanup_empty_dirs_under(){
   local root="$1"
   [ -d "$root" ] || return 0
-  find "$root" -type d -empty -depth 2>/dev/null | while IFS= read -r d; do
-    [ "$d" = "$root" ] && continue
+
+  # Von unten nach oben durchlaufen und alle leeren Verzeichnisse entfernen,
+  # aber den Projektordner selbst (root) stehen lassen.
+  find "$root" -depth -type d 2>/dev/null | while IFS= read -r d; do
+    # Projekt-Ordner selbst nicht löschen
+    if [ "$d" = "$root" ]; then
+      continue
+    fi
+
+    # rmdir löscht nur, wenn das Verzeichnis leer ist
     if rmdir "$d" 2>/dev/null; then
       log "INFO" "FILESTATE: leerer Ordner entfernt: $d"
     fi
@@ -233,7 +241,7 @@ cleanup_empty_dirs_under(){
 apply_filestate_json(){
   local json_file="$1" receiver="$2" project="$3"
   if [ "${FILESTATE_DELETE_ENABLED}" != "1" ]; then
-    log "INFO" "FILESTATE: Delete deaktiviert – JSON wird ignoriert: $json_file"
+    log "INFO" "FILESTATE: Delete deaktiviert - JSON wird ignoriert: $json_file"
     return 0
   fi
 
@@ -272,7 +280,15 @@ apply_filestate_json(){
   fi
 
   if [ ! -s "$tmp_remote" ]; then
-    log "WARN" "FILESTATE: keine relativePath-Einträge gefunden – es wird nichts gelöscht"
+    log "WARN" "FILESTATE: keine relativePath-Einträge gefunden - lösche komplettes Projektverzeichnis"
+    if [ -d "$proj_root" ]; then
+      find "$proj_root" -type f ! -name '*.json' -print0 \
+        | while IFS= read -r -d '' f; do
+            log "INFO" "FILESTATE: lösche Datei (Projekt leer): $f"
+            rm -f -- "$f" || log "WARN" "FILESTATE: Konnte Datei nicht löschen: $f"
+          done
+      cleanup_empty_dirs_under "$proj_root"
+    fi
     rm -f "$tmp_remote" "$tmp_local"
     return 0
   fi
@@ -339,7 +355,7 @@ process_zip_for_receiver_project(){
   done
 
   if [ "${#files[@]}" -eq 0 ]; then
-    log "ERROR" "ZIP hat keine Dateien (nur Verzeichnisse?) – wird als Fehler gewertet: ${zip_path}"
+    log "ERROR" "ZIP hat keine Dateien (nur Verzeichnisse?) - wird als Fehler gewertet: ${zip_path}"
     return 1
   fi
 
@@ -366,7 +382,7 @@ process_zip_for_receiver_project(){
       mkdir -p "${proj_root}/${json_dir}"
     fi
 
-    log "INFO" "FileState-ZIP erkannt (nur JSON: ${json_in_zip}) – extrahiere nach ${proj_root}"
+    log "INFO" "FileState-ZIP erkannt (nur JSON: ${json_in_zip}) - extrahiere nach ${proj_root}"
     if ! unzip -oq "$zip_path" "$json_in_zip" -d "$proj_root" 2>/dev/null; then
       log "ERROR" "Konnte FileState-JSON nicht extrahieren: ${json_in_zip}"
       return 1
@@ -464,10 +480,10 @@ download_binary_to_zip(){
         log "WARN" "SHA256 konnte nicht berechnet werden (Datei=${target_zip})"
       fi
     else
-      log "WARN" "Kein Tool für SHA256 gefunden – Hash-Check übersprungen"
+      log "WARN" "Kein Tool für SHA256 gefunden - Hash-Check übersprungen"
     fi
   else
-    log "INFO" "Kein expected Hash im masterIdentifier – Check übersprungen"
+    log "INFO" "Kein expected Hash im masterIdentifier - Check übersprungen"
   fi
 
   return 0
@@ -480,12 +496,12 @@ delete_doc_and_binary(){
   local dr_id="$1" rel="$2"
 
   if [ "${DELETE_AFTER_DOWNLOAD}" != "1" ]; then
-    log "INFO" "DELETE_AFTER_DOWNLOAD!=1 – FHIR-Delete übersprungen (DocRef=${dr_id})"
+    log "INFO" "DELETE_AFTER_DOWNLOAD!=1 - FHIR-Delete übersprungen (DocRef=${dr_id})"
     return 0
   fi
 
   if [ -z "$dr_id" ]; then
-    log "WARN" "Keine DocRef-ID bekannt – FHIR-Delete übersprungen"
+    log "WARN" "Keine DocRef-ID bekannt - FHIR-Delete übersprungen"
     return 0
   fi
 
@@ -504,7 +520,7 @@ delete_doc_and_binary(){
     delete_with_verify "Binary" "$bid" || log "WARN" "Binary-Delete fehlgeschlagen (Binary=${bid})"
     fhir_delete_history "Binary" "$bid" || true
   else
-    log "WARN" "Keine Binary-ID aus rel ableitbar – Binary-Delete übersprungen"
+    log "WARN" "Keine Binary-ID aus rel ableitbar - Binary-Delete übersprungen"
   fi
 }
 
@@ -526,11 +542,24 @@ elif command -v shasum >/dev/null 2>&1; then
 elif command -v openssl >/dev/null 2>&1; then
   log "INFO" "SHA256-Prüfung via openssl aktiv"
 else
-  log "WARN" "Kein Tool für SHA256 gefunden – Hash-Check wird übersprungen"
+  log "WARN" "Kein Tool für SHA256 gefunden - Hash-Check wird übersprungen"
 fi
 
 log "INFO" "Start; Ziel: $OUTDIR"
 log "INFO" "FHIR-Basis: $BASE"
+
+# Prüfen, ob OUTDIR verfügbar ist (z. B. CIFS-Mount)
+if [ ! -d "$OUTDIR" ]; then
+  log "ERROR" "OUTDIR nicht erreichbar: $OUTDIR - vermutlich CIFS-Mount nicht vorhanden."
+  exit 1
+fi
+
+# Prüfen, ob OUTDIR beschreibbar ist
+if [ ! -w "$OUTDIR" ]; then
+  log "ERROR" "OUTDIR ist nicht beschreibbar: $OUTDIR"
+  exit 1
+fi
+
 log "INFO" "Filter: system=$IDENT_SYSTEM | prefix=$SEARCH_PREFIX | exact=''"
 log "INFO" "DELETE_AFTER_DOWNLOAD=${DELETE_AFTER_DOWNLOAD} FILESTATE_DELETE_ENABLED=${FILESTATE_DELETE_ENABLED} FORCE_HISTORY_DELETE=${FORCE_HISTORY_DELETE}"
 
