@@ -1,6 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+"""
+Example for a FILESTATE:
+
+{
+  "project": "XY",
+  "stateId": "2025-11-14T13:37:00+01:00",
+  "generatedAt": "2025-11-14T13:37:00+01:00",
+  "prefix": "NCT-DKFZ-DE",
+  "targetReceiver": "NAME",
+
+  "files": [
+    {
+      "relativePath": "Pseudo001/studyA/series01.zip",
+      "masterIdentifier": "NCT-DKFZ-DE_DKFZ_XY_abcd1234...",
+      "lastModified": "2025-11-14T12:30:00+01:00",
+      "size": 123456
+    },
+    {
+      "relativePath": "Pseudo001/studyA/series02.zip",
+      "masterIdentifier": "NCT-DKFZ-DE_DKFZ_XY_efefefef...",
+      "lastModified": "2025-11-14T12:32:00+01:00",
+      "size": 234567
+    }
+  ]
+}
+
+"""
+
 ############################
 # Konfiguration
 ############################
@@ -13,6 +41,11 @@ BASE="https://blaze.sci.dkfz.de/fhir"
 IDENT_SYSTEM="http://medizininformatik-initiative.de/sid/project-identifier"
 : "${SEARCH_PREFIX:=NCT-DKFZ-DE_}"
 IDENT_VALUE_EXACT="${IDENT_VALUE_EXACT:-}"
+
+# Spezieller Receiver für FileState-Resourcen
+: "${FILESTATE_RECEIVER:=FILESTATE}"
+# Dateiname im ZIP, der das JSON enthält
+: "${FILESTATE_JSON_NAME:=filestate.json}"
 
 # Nach Download löschen?
 : "${DELETE_AFTER_DOWNLOAD:=1}"      # 1=an, 0=aus
@@ -51,6 +84,7 @@ b64d(){ base64 "$B64_FLAG"; }
 mktemp_zip(){ mktemp -t dkfz_zip.XXXXXX; }
 mktemp_tmp(){ mktemp -t dkfz_tmp.XXXXXX; }
 mktemp_dr(){  mktemp -t dkfz_dr.XXXXXX; }
+mktemp_fs(){  mktemp -t dkfz_fs.XXXXXX; }
 
 # Mapping DocRef-ID -> masterIdentifier.value für Fehlerlogs & Routing-Logs
 DRMI_TMP="$(mktemp -t dkfz_drmi.XXXXXX)"
@@ -165,17 +199,202 @@ binary_id_from_url(){
   if [[ "$u" == Binary/* ]]; then printf '%s\n' "${u#Binary/}" | cut -d/ -f1; else echo ""; fi
 }
 
-extract_binary_ids_from_docref_json(){
-  jq -r '.content[]? | .attachment.url? // empty' "$1" | while IFS= read -r u; do
-    bid="$(binary_id_from_url "$u")"; [ -n "$bid" ] && echo "$bid"
-  done | sort -u
+############################
+# Download eines Binaries zu einer Zieldatei per masterIdentifier
+############################
+download_by_masterid(){
+  local mi="$1"
+  local target_file="$2"
+
+  if [ -z "$mi" ] || [ -z "$target_file" ]; then
+    log "ERROR" "FileState: download_by_masterid mit fehlenden Parametern (mi='${mi-}', target='${target_file-}')"
+    return 1
+  fi
+
+  local enc_sys enc_val url tmp
+  enc_sys="$(printf '%s' "$IDENT_SYSTEM" | sed 's/|/%7C/g')"
+  enc_val="$(printf '%s' "$mi" | sed 's/|/%7C/g')"
+  url="${BASE}/DocumentReference?identifier=${enc_sys}%7C${enc_val}&_count=1"
+
+  tmp="$(mktemp_tmp)"
+  if ! curl_json "$url" -o "$tmp"; then
+    log "ERROR" "FileState: Suche nach masterIdentifier fehlgeschlagen: ${mi}"
+    rm -f "$tmp"
+    return 1
+  fi
+
+  local dr_id att_url
+  dr_id="$(jq -r '.entry[0].resource.id // empty' "$tmp")"
+  att_url="$(jq -r '.entry[0].resource.content[]?.attachment.url // empty' "$tmp" | head -n1)"
+
+  if [ -z "$dr_id" ] || [ -z "$att_url" ]; then
+    log "ERROR" "FileState: Keine passende DocumentReference/Binary für masterIdentifier=${mi}"
+    rm -f "$tmp"
+    return 1
+  fi
+
+  local rel rel_nover bid tmpzip got ver rel_ver
+  rel="$(printf '%s\n' "$att_url" | normalize_rel)"
+  rel_nover="$(printf '%s' "$rel" | strip_history)"
+  bid="$(binary_id_from_url "$rel_nover")"
+
+  if [ -z "$bid" ]; then
+    log "ERROR" "FileState: Konnte Binary-ID nicht aus URL ableiten (masterIdentifier=${mi}, url=${att_url})"
+    rm -f "$tmp"
+    return 1
+  fi
+
+  tmpzip="$(mktemp_zip)"
+  got=0
+
+  # 1) FHIR-JSON (.data)
+  if curl_json "${BASE}/${rel}" | jq -er '.data' | b64d > "$tmpzip" 2>>"$LOG"; then
+    got=1; log "INFO" "FileState: FHIR-JSON erfolgreich: ${rel} (Binary=${bid})"
+  elif curl_json "${BASE}/${rel_nover}" | jq -er '.data' | b64d > "$tmpzip" 2>>"$LOG"; then
+    got=1; log "INFO" "FileState: FHIR-JSON erfolgreich (ohne _history): ${rel_nover} (Binary=${bid})"
+  fi
+
+  # 2) RAW
+  if [ "$got" -eq 0 ]; then
+    if curl_bin "${BASE}/${rel}" -o "$tmpzip" 2>>"$LOG" \
+    || curl_bin "${BASE}/${rel_nover}" -o "$tmpzip" 2>>"$LOG"; then
+      got=1; log "INFO" "FileState: RAW-ZIP erfolgreich: ${rel} (Binary=${bid})"
+    fi
+  fi
+
+  # 3) History-Fallback
+  if [ "$got" -eq 0 ]; then
+    ver="$(curl_json "${BASE}/${rel_nover}/_history" 2>>"$LOG" \
+         | jq -r '.entry[]?.resource?.meta?.versionId // empty' | awk 'NF' | sort -n | tail -n1)"
+    if [ -n "$ver" ]; then
+      rel_ver="${rel_nover}/_history/${ver}"
+      if curl_json "${BASE}/${rel_ver}" | jq -er '.data' | b64d > "$tmpzip" 2>>"$LOG" \
+      || curl_bin "${BASE}/${rel_ver}" -o "$tmpzip" 2>>"$LOG"; then
+        got=1; log "INFO" "FileState: Versioniertes Read erfolgreich: ${rel_ver} (Binary=${bid})"
+      fi
+    fi
+  fi
+
+  if [ "$got" -eq 0 ]; then
+    log "ERROR" "FileState: Download Binary fehlgeschlagen (masterIdentifier=${mi}, Binary=${bid})"
+    rm -f "$tmpzip" "$tmp"
+    return 1
+  fi
+
+  # SHA-Check aus masterIdentifier (letzte Komponente)
+  local expected_hash
+  expected_hash="$(printf '%s' "$mi" | awk -F'_' '{print $NF}' | tr '[:upper:]' '[:lower:]')"
+  if [ -n "$expected_hash" ]; then
+    if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || command -v openssl >/dev/null 2>&1; then
+      local act
+      act="$(compute_sha256 "$tmpzip")"
+      if [ -n "$act" ]; then
+        if [ "$act" = "$expected_hash" ]; then
+          log "INFO" "${GREEN}FileState: SHA256 OK (Binary=${bid}): $act${NC}"
+        else
+          log "WARN" "${RED}FileState: SHA256 MISMATCH (Binary=${bid}): expected=$expected_hash got=$act${NC}"
+        fi
+      else
+        log "WARN" "FileState: SHA256 konnte nicht berechnet werden (Binary=${bid})"
+      fi
+    fi
+  fi
+
+  mkdir -p "$(dirname "$target_file")"
+  mv "$tmpzip" "$target_file"
+  log "SUCCESS" "FileState: Datei gespeichert: ${target_file} (Binary=${bid})"
+
+  if [ "${DELETE_AFTER_DOWNLOAD}" = "1" ]; then
+    delete_with_verify "Binary" "$bid" || true
+    fhir_delete_history "Binary" "$bid" || true
+    delete_with_verify "DocumentReference" "$dr_id" || true
+    fhir_delete_history "DocumentReference" "$dr_id" || true
+  fi
+
+  rm -f "$tmp"
+  return 0
+}
+
+############################
+# FileState-JSON anwenden
+############################
+apply_filestate_json(){
+  local json="$1"
+
+  local project targetReceiver prefix_json
+  project="$(jq -r '.project // empty' "$json")" || project=""
+  targetReceiver="$(jq -r '.targetReceiver // empty' "$json")" || targetReceiver=""
+  prefix_json="$(jq -r '.prefix // empty' "$json")" || prefix_json=""
+
+  if [ -z "$project" ]; then
+    log "ERROR" "FileState: JSON ohne 'project' – wird ignoriert"
+    return 1
+  fi
+
+  local safe_proj safe_recv proj_root
+  safe_proj="$(printf '%s' "$project" | safe_project)"
+  [ -z "$safe_proj" ] && safe_proj="UNKNOWN"
+
+  if [ -n "$targetReceiver" ]; then
+    safe_recv="$(printf '%s' "$targetReceiver" | safe_project)"
+    [ -z "$safe_recv" ] && safe_recv="UNKNOWN_RECEIVER"
+    proj_root="${OUTDIR}/${safe_recv}/${safe_proj}"
+  else
+    proj_root="${OUTDIR}/${safe_proj}"
+  fi
+
+  mkdir -p "$proj_root"
+
+  log "INFO" "FileState: anwenden auf project='${project}' targetReceiver='${targetReceiver}' proj_root='${proj_root}' prefix='${prefix_json}'"
+
+  local files_tsv desired_paths actual_paths
+  files_tsv="$(mktemp_fs)"
+  desired_paths="$(mktemp_fs)"
+  actual_paths="$(mktemp_fs)"
+
+  if ! jq -r '.files[]? | [.relativePath, .masterIdentifier] | @tsv' "$json" > "$files_tsv"; then
+    log "ERROR" "FileState: JSON ohne gültige files-Liste"
+    rm -f "$files_tsv" "$desired_paths" "$actual_paths"
+    return 1
+  fi
+
+  cut -f1 "$files_tsv" | awk 'NF' | sort -u > "$desired_paths"
+
+  if [ -d "$proj_root" ]; then
+    ( cd "$proj_root" && find . -type f | sed 's#^\./##' ) | awk 'NF' | sort -u > "$actual_paths"
+  else
+    : > "$actual_paths"
+  fi
+
+  # Löschen: Dateien, die im lokalen Projektordner existieren, aber nicht mehr im FileState sind
+  local p
+  while IFS= read -r p; do
+    grep -Fxq "$p" "$desired_paths" && continue
+    log "INFO" "FileState: lösche veraltete Datei: ${proj_root}/${p}"
+    rm -f "${proj_root}/${p}" || log "WARN" "FileState: Konnte Datei nicht löschen: ${proj_root}/${p}"
+  done < "$actual_paths"
+
+  # Nachziehen: Dateien, die im FileState stehen, aber lokal noch fehlen
+  local rel_path mi full_path
+  while IFS=$'\t' read -r rel_path mi; do
+    [ -z "$rel_path" ] && continue
+    full_path="${proj_root}/${rel_path}"
+    if [ -f "$full_path" ]; then
+      continue
+    fi
+    log "INFO" "FileState: fehlende Datei, masterIdentifier='${mi}', pfad='${full_path}' – Suche im FHIR"
+    download_by_masterid "$mi" "$full_path" || log "ERROR" "FileState: Download für masterIdentifier='${mi}' fehlgeschlagen"
+  done < "$files_tsv"
+
+  rm -f "$files_tsv" "$desired_paths" "$actual_paths"
+  return 0
 }
 
 ############################
 # Vorbereitungen
 ############################
 : > "$LOG"; mkdir -p "$OUTDIR"; touch "$STATE"
-need_bin curl; need_bin jq; need_bin base64; need_bin ssh; need_bin sed; need_bin awk; need_bin lsof
+need_bin curl; need_bin jq; need_bin base64; need_bin ssh; need_bin sed; need_bin awk; need_bin lsof; need_bin unzip; need_bin find
 
 if command -v sha256sum >/dev/null 2>&1; then log "INFO" "SHA256-Prüfung via sha256sum aktiv"
 elif command -v shasum >/dev/null 2>&1; then   log "INFO" "SHA256-Prüfung via shasum aktiv"
@@ -184,7 +403,7 @@ else log "WARN" "Kein Tool für SHA256 gefunden – Hash-Check wird übersprunge
 
 log "INFO" "Start; Ziel: $OUTDIR, State: $STATE"
 log "INFO" "Filter: system=$IDENT_SYSTEM | prefix=$SEARCH_PREFIX | exact='${IDENT_VALUE_EXACT:-}'"
-log "INFO" "DELETE_AFTER_DOWNLOAD=${DELETE_AFTER_DOWNLOAD} FORCE_HISTORY_DELETE=${FORCE_HISTORY_DELETE}"
+log "INFO" "DELETE_AFTER_DOWNLOAD=${DELETE_AFTER_DOWNLOAD} FORCE_HISTORY_DELETE=${FORCE_HISTORY_DELETE} FILESTATE_RECEIVER=${FILESTATE_RECEIVER}"
 
 ############################
 # Lock + SSH-Tunnel
@@ -239,12 +458,12 @@ fi
 log "INFO" "delete-history beworben: ${HAS_DELETE_HISTORY}"
 
 ############################
-# Kandidaten sammeln (nur DocumentReference)
+# Kandidaten sammeln – nur FileState-DocumentReferences
 ############################
 # Struktur: "RECEIVER|||PROJECT|||Binary/<id>|||HASH|||DR:<docref-id>"
-RELS=(); TMP="$(mktemp_tmp)"; found_pages=0; found_urls=0
+RELS_FS=(); TMP="$(mktemp_tmp)"; found_pages=0; found_urls=0
 
-# (A) Exakt
+# (A) Exakt (optional – wird nur verwendet, wenn IDENT_VALUE_EXACT gesetzt ist)
 if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
   URL="${BASE}/DocumentReference?identifier=$(printf '%s' "$IDENT_SYSTEM" | sed 's/|/%7C/g')%7C$(printf '%s' "$IDENT_VALUE_EXACT" | sed 's/|/%7C/g')&_count=200"
   while [ -n "$URL" ] && [ $found_pages -lt $MAX_PAGES ]; do
@@ -276,8 +495,9 @@ if [ -n "${IDENT_VALUE_EXACT:-}" ]; then
 
     if [ -n "$lines_tsv" ]; then
       while IFS=$'\t' read -r _drid _recv _proj _url _hash; do
+        [ "$_recv" != "$FILESTATE_RECEIVER" ] && continue
         bid="$(binary_id_from_url "$_url")"
-        [ -n "$bid" ] && RELS+=("${_recv}|||${_proj}|||Binary/${bid}|||${_hash}|||DR:${_drid}") && found_urls=$((found_urls+1))
+        [ -n "$bid" ] && RELS_FS+=("${_recv}|||${_proj}|||Binary/${bid}|||${_hash}|||DR:${_drid}") && found_urls=$((found_urls+1))
       done <<< "$lines_tsv"
     fi
     URL="$(next_url "$TMP")"
@@ -316,27 +536,30 @@ while [ -n "$URL" ] && [ $found_pages -lt $MAX_PAGES ]; do
 
   if [ -n "$lines_tsv" ]; then
     while IFS=$'\t' read -r _drid _recv _proj _url _hash; do
+      [ "$_recv" != "$FILESTATE_RECEIVER" ] && continue
       bid="$(binary_id_from_url "$_url")"
-      [ -n "$bid" ] && RELS+=("${_recv}|||${_proj}|||Binary/${bid}|||${_hash}|||DR:${_drid}") && found_urls=$((found_urls+1))
+      [ -n "$bid" ] && RELS_FS+=("${_recv}|||${_proj}|||Binary/${bid}|||${_hash}|||DR:${_drid}") && found_urls=$((found_urls+1))
     done <<< "$lines_tsv"
   fi
   URL="$(next_url "$TMP")"
 done
 
 # Deduplizieren
-if [ "${#RELS[@]}" -eq 0 ]; then
-  log "WARN" "keine Kandidaten gefunden (pages=$found_pages, urls=$found_urls)"
+if [ "${#RELS_FS[@]}" -eq 0 ]; then
+  log "WARN" "keine FileState-Kandidaten gefunden (pages=$found_pages, urls=$found_urls)"
+  log "INFO" "Fertig (nichts zu tun)"
   exit 0
 else
-  deduped="$(printf '%s\n' "${RELS[@]}" | awk 'NF' | sort -u)"
-  RELS=(); while IFS= read -r line; do [ -n "$line" ] && RELS+=("$line"); done <<< "$deduped"
-  log "INFO" "Kandidaten gesamt (dedupliziert): ${#RELS[@]}"
+  deduped="$(printf '%s\n' "${RELS_FS[@]}" | awk 'NF' | sort -u)"
+  RELS_FS=()
+  while IFS= read -r line; do [ -n "$line" ] && RELS_FS+=("$line"); done <<< "$deduped"
+  log "INFO" "FileState-DocumentReferences gesamt (dedupliziert): ${#RELS_FS[@]}"
 fi
 
 ############################
-# Download + optionales Delete
+# FileState-Download + Anwendung + optionales Delete
 ############################
-for entry in "${RELS[@]}"; do
+for entry in "${RELS_FS[@]}"; do
   receiver="${entry%%|||*}"
   rest="${entry#*|||}"
   project="${rest%%|||*}"
@@ -347,61 +570,32 @@ for entry in "${RELS[@]}"; do
   meta="${rest3#*|||}"; [ "$meta" = "$rest3" ] && meta=""
   dr_id=""; [[ "$meta" == DR:* ]] && dr_id="${meta#DR:}"
 
-  # Zielpfade: optional Empfänger als Überordner
-  if [ -n "$project" ]; then
-    safe_proj="$(printf '%s' "$project" | safe_project)"; [ -z "$safe_proj" ] && safe_proj="UNKNOWN"
-    if [ -n "$receiver" ]; then
-      safe_recv="$(printf '%s' "$receiver" | safe_project)"; [ -z "$safe_recv" ] && safe_recv="UNKNOWN_RECEIVER"
-      destdir="${OUTDIR}/${safe_recv}/${safe_proj}"
-    else
-      destdir="${OUTDIR}/${safe_proj}"
-    fi
-  else
-    destdir="${OUTDIR}"
-  fi
-  mkdir -p "$destdir"
-
-  # Routing-Log: wie wurde der masterIdentifier aufgelöst?
-  mi_val="$(get_mi_value "$dr_id")"
-  if [ -n "${mi_val:-}" ]; then
-    log "INFO" "Routing: masterIdentifier='${mi_val}' → receiver='${receiver:-}' project='${project:-}' destdir='${destdir}'"
-  else
-    log "INFO" "Routing: masterIdentifier=<unbekannt> → receiver='${receiver:-}' project='${project:-}' destdir='${destdir}'"
-  fi
-
-  rel="${rel#/}"; rel_nover="$(printf '%s' "$rel" | strip_history)"
+  # FileState-ZIP (Binary) holen
+  rel="${rel#/}"
+  rel_nover="$(printf '%s' "$rel" | strip_history)"
   bid="$(binary_id_from_url "$rel_nover")"
-  zip_path="${destdir}/${bid:-unknown}.zip"
-  unpack_dir="${destdir}/${bid:-unknown}"
-  marker="${zip_path}.done"
-
-  # Bereits geladen?
-  if [ -n "${bid}" ] && grep -qx "$bid" "$STATE"; then
-    if [ -f "$zip_path" ]; then log "INFO" "skip ${bid} (bereits geladen; ZIP vorhanden)"; continue; fi
-    if [ -d "$unpack_dir" ] || [ -f "$marker" ]; then log "INFO" "skip ${bid} (entpackt/Marker vorhanden)"; continue; fi
-    log "INFO" "Re-Download: ${bid}"
-  fi
 
   tmpzip="$(mktemp_zip)"
-  log "INFO" "lade $rel (receiver=${receiver:-''}, project=${project:-''})"
-
   got=0
+
+  log "INFO" "FileState-DocRef=${dr_id:-?}, Binary-Rel=${rel}"
+
   # 1) FHIR-JSON (.data)
   if curl_json "${BASE}/${rel}" | jq -er '.data' | b64d > "$tmpzip" 2>>"$LOG"; then
-    got=1; log "INFO" "FHIR-JSON erfolgreich: $rel"
+    got=1; log "INFO" "FileState: FHIR-JSON erfolgreich: $rel"
   elif curl_json "${BASE}/${rel_nover}" | jq -er '.data' | b64d > "$tmpzip" 2>>"$LOG"; then
-    got=1; log "INFO" "FHIR-JSON erfolgreich (ohne _history): $rel_nover"
+    got=1; log "INFO" "FileState: FHIR-JSON erfolgreich (ohne _history): $rel_nover"
   fi
 
   # 2) RAW
   if [ "$got" -eq 0 ]; then
     if curl_bin "${BASE}/${rel}" -o "$tmpzip" 2>>"$LOG" \
     || curl_bin "${BASE}/${rel_nover}" -o "$tmpzip" 2>>"$LOG"; then
-      got=1; log "INFO" "RAW-ZIP erfolgreich: $rel"
+      got=1; log "INFO" "FileState: RAW-ZIP erfolgreich: $rel"
     fi
   fi
 
-  # 3) History-Fallback (neueste versionId)
+  # 3) History-Fallback
   if [ "$got" -eq 0 ]; then
     ver="$(curl_json "${BASE}/${rel_nover}/_history" 2>>"$LOG" \
          | jq -r '.entry[]?.resource?.meta?.versionId // empty' | awk 'NF' | sort -n | tail -n1)"
@@ -409,39 +603,65 @@ for entry in "${RELS[@]}"; do
       rel_ver="${rel_nover}/_history/${ver}"
       if curl_json "${BASE}/${rel_ver}" | jq -er '.data' | b64d > "$tmpzip" 2>>"$LOG" \
       || curl_bin "${BASE}/${rel_ver}" -o "$tmpzip" 2>>"$LOG"; then
-        got=1; log "INFO" "Versioniertes Read erfolgreich: $rel_ver"
+        got=1; log "INFO" "FileState: Versioniertes Read erfolgreich: $rel_ver"
       fi
     fi
   fi
 
   if [ "$got" -eq 0 ]; then
-    mi="$(get_mi_value "$dr_id")"
-    log "ERROR" "Download fehlgeschlagen: rel=${rel} | DocRef=${dr_id:-?} | masterIdentifier='${mi:-unbekannt}'"
+    local_mi="$(get_mi_value "$dr_id")"
+    log "ERROR" "FileState: Download fehlgeschlagen: rel=${rel} | DocRef=${dr_id:-?} | masterIdentifier='${local_mi:-unbekannt}'"
     rm -f "$tmpzip"
     continue
   fi
 
-  # SHA-256 Check (informativ)
+  # SHA-Check falls Hash im masterIdentifier des FileState-DocRefs hinterlegt war
   if [ -n "$expected_hash" ]; then
     exp="$(printf '%s' "$expected_hash" | tr '[:upper:]' '[:lower:]')"
     if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || command -v openssl >/dev/null 2>&1; then
       act="$(compute_sha256 "$tmpzip")"
       if [ -n "$act" ]; then
-        [ "$act" = "$exp" ] && log "INFO" "${GREEN}SHA256 OK (ID=${bid:-unknown}): $act${NC}" \
-                             || log "WARN" "${RED}SHA256 MISMATCH (ID=${bid:-unknown}): expected=$exp got=$act${NC}"
+        [ "$act" = "$exp" ] && log "INFO" "${GREEN}FileState ZIP SHA256 OK (Binary=${bid:-unknown}): $act${NC}" \
+                             || log "WARN" "${RED}FileState ZIP SHA256 MISMATCH (Binary=${bid:-unknown}): expected=$exp got=$act${NC}"
       else
-        log "WARN" "SHA256 konnte nicht berechnet werden (ID=${bid:-unknown})"
+        log "WARN" "FileState ZIP: SHA256 konnte nicht berechnet werden (Binary=${bid:-unknown})"
       fi
     fi
-  else
-    log "INFO" "Kein expected Hash im masterIdentifier – Check übersprungen"
   fi
 
-  mv "$tmpzip" "$zip_path"
-  [ -n "${bid}" ] && echo "$bid" >> "$STATE"
-  log "SUCCESS" "gespeichert: ${zip_path}"
+  # JSON aus dem ZIP holen
+  fs_json="$(mktemp_fs)"
+  if ! unzip -p "$tmpzip" "$FILESTATE_JSON_NAME" > "$fs_json" 2>/dev/null; then
+    # Fallback: erste JSON-Datei im ZIP nehmen
+    json_name="$(unzip -Z1 "$tmpzip" 2>/dev/null | awk '/\.json$/ {print; exit}')"
+    if [ -z "${json_name:-}" ]; then
+      log "ERROR" "FileState: ZIP enthält keine JSON-Datei"
+      rm -f "$fs_json" "$tmpzip"
+      continue
+    fi
+    if ! unzip -p "$tmpzip" "$json_name" > "$fs_json" 2>/dev/null; then
+      log "ERROR" "FileState: JSON '${json_name}' konnte nicht extrahiert werden"
+      rm -f "$fs_json" "$tmpzip"
+      continue
+    fi
+  fi
 
-  # --- optional: Löschen nach erfolgreichem Download ---
+  log "INFO" "FileState: JSON extrahiert, wende Zustand an (DocRef=${dr_id:-?})"
+  apply_filestate_json "$fs_json" || log "ERROR" "FileState: Anwenden des JSON ist fehlgeschlagen"
+
+  # FileState-ZIP optional in OUTDIR ablegen (für Debug)
+  if [ -n "$project" ]; then
+    safe_proj="$(printf '%s' "$project" | safe_project)"; [ -z "$safe_proj" ] && safe_proj="UNKNOWN"
+    safe_recv="$(printf '%s' "$receiver" | safe_project)"; [ -z "$safe_recv" ] && safe_recv="UNKNOWN_RECEIVER"
+    destdir="${OUTDIR}/${safe_recv}/${safe_proj}"
+  else
+    destdir="${OUTDIR}/${receiver:-FILESTATE}"
+  fi
+  mkdir -p "$destdir"
+  mv "$tmpzip" "${destdir}/${bid:-filestate}.zip"
+  log "SUCCESS" "FileState: ZIP gespeichert unter ${destdir}/${bid:-filestate}.zip"
+
+  # FileState-DocRef + Binary im FHIR löschen
   if [ "${DELETE_AFTER_DOWNLOAD}" = "1" ]; then
     if [ -n "${dr_id:-}" ]; then
       if ! _verify_gone "DocumentReference" "$dr_id"; then
@@ -451,30 +671,18 @@ for entry in "${RELS[@]}"; do
       fi
       fhir_delete_history "DocumentReference" "$dr_id" || true
     else
-      log "WARN" "Keine DocRef-ID bekannt – überspringe DocRef-DELETE"
+      log "WARN" "FileState: keine DocRef-ID bekannt – DocRef-DELETE übersprungen"
     fi
 
-    if [ -n "${bid}" ]; then
+    if [ -n "${bid:-}" ]; then
       delete_with_verify "Binary" "$bid" || true
       fhir_delete_history "Binary" "$bid" || true
     else
-      if [ -n "${dr_id:-}" ]; then
-        tmp_dr="$(mktemp_dr)"
-        if curl_json "${BASE}/DocumentReference/${dr_id}" -o "$tmp_dr"; then
-          while IFS= read -r bbid; do
-            [ -z "$bbid" ] && continue
-            delete_with_verify "Binary" "$bbid" || true
-            fhir_delete_history "Binary" "$bbid" || true
-          done < <(extract_binary_ids_from_docref_json "$tmp_dr")
-        else
-          log "WARN" "DocRef/${dr_id} nicht lesbar – Binary-DELETE übersprungen"
-        fi
-        rm -f "$tmp_dr"
-      else
-        log "WARN" "Weder Binary-ID noch DocRef-ID verfügbar – Binary-DELETE übersprungen"
-      fi
+      log "WARN" "FileState: keine Binary-ID bekannt – Binary-DELETE übersprungen"
     fi
   fi
+
+  rm -f "$fs_json"
 done
 
 log "INFO" "Fertig"
