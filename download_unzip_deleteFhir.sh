@@ -15,7 +15,34 @@ TMP_DIR="${TMP_DIR:-$SCRIPT_DIR/tmp}"
 mkdir -p "$RUN_DIR" "$LOG_DIR" "$TMP_DIR"
 
 LOG="${LOG:-$LOG_DIR/download_unzip_deleteFhir.log}"
-: > "$LOG"
+
+# Log-Retention: nur Zeilen der letzten 24 Stunden behalten
+if [ -f "$LOG" ]; then
+  cutoff="$(date -d '24 hours ago' +%s)"
+
+  tmp_log="${LOG}.tmp"
+
+  # Filtere nur Zeilen, deren Zeitstempel innerhalb der letzten 24h liegt
+  awk -v cutoff="$cutoff" '
+    {
+      # Format: 2025-12-11T13:22:05+01:00 [INFO] ...
+      # Extrahiere Timestamp-Feld
+      ts = $1
+
+      # +%Y-%m-%dT%H:%M:%S interpretieren → Unix timestamp
+      gsub(/T/, " ", ts)
+      sub(/\+.*$/, "", ts)
+
+      cmd = "date -d \"" ts "\" +%s"
+      cmd | getline t
+      close(cmd)
+
+      if (t >= cutoff) print $0
+    }
+  ' "$LOG" > "$tmp_log"
+
+  mv "$tmp_log" "$LOG"
+fi
 
 ############################
 # Konfiguration
