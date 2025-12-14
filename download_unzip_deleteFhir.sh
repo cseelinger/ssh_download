@@ -3,7 +3,7 @@ set -euo pipefail
 umask 0077
 
 ############################
-# Pfade relativ zum Projektordner
+# Paths relative to the project directory
 ############################
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
 
@@ -16,20 +16,23 @@ mkdir -p "$RUN_DIR" "$LOG_DIR" "$TMP_DIR"
 
 LOG="${LOG:-$LOG_DIR/download_unzip_deleteFhir.log}"
 
-# Log-Retention: nur Zeilen der letzten 24 Stunden behalten
+# Log retention configuration (in hours; default 72 = 3 days)
+LOG_RETENTION_HOURS="${LOG_RETENTION_HOURS:-72}"
+
+# Log retention: keep only lines from the last LOG_RETENTION_HOURS hours
 if [ -f "$LOG" ]; then
-  cutoff="$(date -d '24 hours ago' +%s)"
+  cutoff="$(date -d "${LOG_RETENTION_HOURS} hours ago" +%s)"
 
   tmp_log="${LOG}.tmp"
 
-  # Filtere nur Zeilen, deren Zeitstempel innerhalb der letzten 24h liegt
+  # Keep only lines whose timestamp is within the last LOG_RETENTION_HOURS hours
   awk -v cutoff="$cutoff" '
     {
       # Format: 2025-12-11T13:22:05+01:00 [INFO] ...
-      # Extrahiere Timestamp-Feld
+      # Extract timestamp field
       ts = $1
 
-      # +%Y-%m-%dT%H:%M:%S interpretieren → Unix timestamp
+      # Convert to format that date can parse: %Y-%m-%dT%H:%M:%S → Unix timestamp
       gsub(/T/, " ", ts)
       sub(/\+.*$/, "", ts)
 
@@ -45,17 +48,17 @@ if [ -f "$LOG" ]; then
 fi
 
 ############################
-# Konfiguration
+# Configuration
 ############################
-# Basis-URL des FHIR-Servers (muss auf /fhir enden)
+# Base URL of the FHIR server (must end with /fhir)
 BASE="${FHIR_BASE:-https://blaze.sci.dkfz.de/fhir}"
 
-# FHIR-Identifier-Filter (auf DocumentReference)
+# FHIR identifier filter (on DocumentReference)
 IDENT_SYSTEM="http://medizininformatik-initiative.de/sid/project-identifier"
-# Präfix für masterIdentifier.value (inkl. Unterstrich)
+# Prefix for masterIdentifier.value (including underscore)
 : "${SEARCH_PREFIX:=NCT-DKFZ-DE_}"
 
-# Netzwerk/Download-Parameter
+# Network / download parameters
 CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-5}"
 MAX_TIME="${MAX_TIME:-120}"
 RETRIES="${RETRIES:-2}"
@@ -63,17 +66,17 @@ RETRY_DELAY="${RETRY_DELAY:-2}"
 MAX_PAGES="${MAX_PAGES:-50}"
 PAGE_SIZE="${PAGE_SIZE:-200}"
 
-# Löschen in FHIR nach erfolgreicher Verarbeitung?
+# Delete in FHIR after successful processing?
 : "${DELETE_AFTER_DOWNLOAD:=1}"
-# delete-history erzwingen, auch wenn Capability nicht beworben
+# Force delete-history even if capability is not advertised
 : "${FORCE_HISTORY_DELETE:=1}"
-# FileState-Löschlogik aktiv?
+# Apply FileState delete logic?
 : "${FILESTATE_DELETE_ENABLED:=1}"
-# Name/Muster der FileState-JSON im ZIP
+# Name/pattern of the FileState JSON inside the ZIP
 : "${FILESTATE_JSON_PATTERN:=filestate.json}"
 
 ############################
-# Hilfsfunktionen
+# Helper functions
 ############################
 GREEN=$'\033[32m'; RED=$'\033[31m'; YELLOW=$'\033[33m'; NC=$'\033[0m'
 
@@ -89,7 +92,7 @@ ts(){
 
 log(){ echo "$(ts) [$1] $2" | tee -a "$LOG"; }
 die(){ log "ERROR" "$1"; exit 1; }
-need_bin(){ command -v "$1" >/dev/null 2>&1 || die "fehlendes Programm: $1"; }
+need_bin(){ command -v "$1" >/dev/null 2>&1 || die "missing program: $1"; }
 
 if base64 --help 2>/dev/null | grep -q '\-d'; then B64_FLAG="-d"; else B64_FLAG="-D"; fi
 b64d(){ base64 "$B64_FLAG"; }
@@ -155,7 +158,7 @@ next_url(){
 }
 
 ############################
-# FHIR-Delete-Helfer
+# FHIR delete helpers
 ############################
 _delete_ok(){
   case "${1-}" in
@@ -190,12 +193,12 @@ _verify_gone(){
 delete_with_verify(){
   local rtype="${1-}" rid="${2-}"
   if [ -z "$rtype" ] || [ -z "$rid" ]; then
-    log "ERROR" "DELETE: fehlender Parameter (rtype='${rtype-}', id='${rid-}')"
+    log "ERROR" "DELETE: missing parameter (rtype='${rtype-}', id='${rid-}')"
     return 1
   fi
 
   if _verify_gone "$rtype" "$rid"; then
-    log "INFO" "${rtype}/${rid} bereits entfernt (verify=gone)"
+    log "INFO" "${rtype}/${rid} already gone (verify=gone)"
     return 0
   fi
 
@@ -204,13 +207,13 @@ delete_with_verify(){
   while :; do
     code="$(_http_delete "$url")"
     if [ "$code" = "000" ]; then
-      log "WARN" "Transportfehler beim DELETE (kein HTTP-Code) - URL=$url"
+      log "WARN" "Transport error during DELETE (no HTTP code) - URL=$url"
     else
       log "INFO" "DELETE ${rtype}/${rid} → $code"
     fi
 
     if _verify_gone "$rtype" "$rid"; then
-      log "INFO" "${rtype}/${rid} entfernt (verify=gone)"
+      log "INFO" "${rtype}/${rid} removed (verify=gone)"
       return 0
     fi
 
@@ -219,18 +222,18 @@ delete_with_verify(){
     sleep 1
   done
 
-  log "ERROR" "${rtype}/${rid} nach DELETE noch vorhanden (verify!=gone)"
+  log "ERROR" "${rtype}/${rid} still present after DELETE (verify!=gone)"
   return 1
 }
 
 fhir_delete_history(){
   local rtype="${1-}" rid="${2-}"
   if [ -z "$rtype" ] || [ -z "$rid" ]; then
-    log "ERROR" "DELETE _history: fehlender Parameter (rtype='${rtype-}', id='${rid-}')"
+    log "ERROR" "DELETE _history: missing parameter (rtype='${rtype-}', id='${rid-}')"
     return 1
   fi
   if [ "${HAS_DELETE_HISTORY:-0}" != "1" ] && [ "${FORCE_HISTORY_DELETE}" != "1" ]; then
-    log "INFO" "History-Delete nicht beworben - übersprungen für ${rtype}/${rid}"
+    log "INFO" "History delete not advertised - skipped for ${rtype}/${rid}"
     return 0
   fi
   local url="${BASE}/${rtype}/${rid}/_history"
@@ -244,23 +247,23 @@ fhir_delete_history(){
 }
 
 ############################
-# Filestate-Helfer
+# FileState helpers
 ############################
 cleanup_empty_dirs_under(){
   local root="$1"
   [ -d "$root" ] || return 0
 
-  # Von unten nach oben durchlaufen und alle leeren Verzeichnisse entfernen,
-  # aber den Projektordner selbst (root) stehen lassen.
+  # Walk from bottom to top and remove empty directories,
+  # but keep the project root directory itself.
   find "$root" -depth -type d 2>/dev/null | while IFS= read -r d; do
-    # Projekt-Ordner selbst nicht löschen
+    # Do not delete the project root itself
     if [ "$d" = "$root" ]; then
       continue
     fi
 
-    # rmdir löscht nur, wenn das Verzeichnis leer ist
+    # rmdir only removes if the directory is empty
     if rmdir "$d" 2>/dev/null; then
-      log "INFO" "FILESTATE: leerer Ordner entfernt: $d"
+      log "INFO" "FILESTATE: removed empty directory: $d"
     fi
   done
 }
@@ -268,7 +271,7 @@ cleanup_empty_dirs_under(){
 apply_filestate_json(){
   local json_file="$1" receiver="$2" project="$3"
   if [ "${FILESTATE_DELETE_ENABLED}" != "1" ]; then
-    log "INFO" "FILESTATE: Delete deaktiviert - JSON wird ignoriert: $json_file"
+    log "INFO" "FILESTATE: delete disabled - ignoring JSON: $json_file"
     return 0
   fi
 
@@ -290,29 +293,29 @@ apply_filestate_json(){
   proj_root="${OUTDIR}/${safe_recv}/${safe_proj}"
   mkdir -p "$proj_root"
 
-  log "INFO" "FILESTATE: anwenden auf receiver='${eff_receiver}' project='${eff_project}' proj_root='${proj_root}'"
+  log "INFO" "FILESTATE: apply for receiver='${eff_receiver}' project='${eff_project}' proj_root='${proj_root}'"
 
   local tmp_remote tmp_local
   tmp_remote="$(mktemp_tmp)"
   tmp_local="$(mktemp_tmp)"
 
-  # Alle relativePath-Einträge rekursiv einsammeln
+  # Collect all relativePath entries recursively
   if ! jq -r '.. | objects | .relativePath? // empty' "$json_file" 2>/dev/null \
       | awk 'NF' \
       | sed 's#^\./##' \
       | sort -u > "$tmp_remote"; then
-    log "ERROR" "FILESTATE: relativePath-Auswertung fehlgeschlagen: $json_file"
+    log "ERROR" "FILESTATE: failed to evaluate relativePath entries: $json_file"
     rm -f "$tmp_remote" "$tmp_local"
     return 1
   fi
 
   if [ ! -s "$tmp_remote" ]; then
-    log "WARN" "FILESTATE: keine relativePath-Einträge gefunden - lösche komplettes Projektverzeichnis"
+    log "WARN" "FILESTATE: no relativePath entries found - delete complete project directory"
     if [ -d "$proj_root" ]; then
       find "$proj_root" -type f ! -name '*.json' -print0 \
         | while IFS= read -r -d '' f; do
-            log "INFO" "FILESTATE: lösche Datei (Projekt leer): $f"
-            rm -f -- "$f" || log "WARN" "FILESTATE: Konnte Datei nicht löschen: $f"
+            log "INFO" "FILESTATE: deleting file (project empty): $f"
+            rm -f -- "$f" || log "WARN" "FILESTATE: could not delete file: $f"
           done
       cleanup_empty_dirs_under "$proj_root"
     fi
@@ -320,7 +323,7 @@ apply_filestate_json(){
     return 0
   fi
 
-  # Lokale Dateien im Projekt (ohne JSON)
+  # Local files in the project (excluding JSON)
   if [ -d "$proj_root" ]; then
     ( cd "$proj_root" && find . -type f ! -name '*.json' -print | sed 's#^\./##' ) \
       | sort -u > "$tmp_local" || true
@@ -328,18 +331,18 @@ apply_filestate_json(){
     : > "$tmp_local"
   fi
 
-  # Dateien löschen, die lokal existieren, aber nicht mehr im FileState stehen
+  # Delete files that exist locally but are no longer present in the FileState
   local rel full
   while IFS= read -r rel; do
     [ -z "$rel" ] && continue
     if ! grep -Fxq "$rel" "$tmp_remote"; then
       case "$rel" in
-        *".."*) log "WARN" "FILESTATE: ignoriere verdächtigen Pfad mit '..': $rel"; continue ;;
+        *".."*) log "WARN" "FILESTATE: ignoring suspicious path with '..': $rel"; continue ;;
       esac
       full="${proj_root}/${rel}"
       if [ -f "$full" ]; then
-        log "INFO" "FILESTATE: lösche Datei: $full"
-        rm -f -- "$full" || log "WARN" "FILESTATE: Konnte Datei nicht löschen: $full"
+        log "INFO" "FILESTATE: deleting file: $full"
+        rm -f -- "$full" || log "WARN" "FILESTATE: could not delete file: $full"
       fi
     fi
   done < "$tmp_local"
@@ -351,7 +354,7 @@ apply_filestate_json(){
 }
 
 ############################
-# ZIP verarbeiten
+# Process ZIP file
 ############################
 process_zip_for_receiver_project(){
   local zip_path="$1" receiver="$2" project="$3"
@@ -367,14 +370,14 @@ process_zip_for_receiver_project(){
   proj_root="${OUTDIR}/${safe_recv}/${safe_proj}"
   mkdir -p "$proj_root"
 
-  log "INFO" "ZIP-Verarbeitung: zip='${zip_path}' → receiver='${eff_receiver}' project='${eff_project}' proj_root='${proj_root}'"
+  log "INFO" "Processing ZIP: zip='${zip_path}' → receiver='${eff_receiver}' project='${eff_project}' proj_root='${proj_root}'"
 
   local entries files json_files normal_files
   mapfile -t entries < <(unzip -Z1 "$zip_path" 2>/dev/null || true)
 
   files=()
   for e in "${entries[@]}"; do
-    # Verzeichnisse enden mit /
+    # Directories end with /
     if [[ "$e" == */ ]]; then
       continue
     fi
@@ -382,7 +385,7 @@ process_zip_for_receiver_project(){
   done
 
   if [ "${#files[@]}" -eq 0 ]; then
-    log "ERROR" "ZIP hat keine Dateien (nur Verzeichnisse?) - wird als Fehler gewertet: ${zip_path}"
+    log "ERROR" "ZIP has no files (only directories?) - treated as error: ${zip_path}"
     return 1
   fi
 
@@ -390,7 +393,7 @@ process_zip_for_receiver_project(){
   normal_files=()
   local f
   for f in "${files[@]}"; do
-    # FILESTATE_JSON_PATTERN als (Teil-)Muster behandeln
+    # Treat FILESTATE_JSON_PATTERN as (sub-)pattern
     if [[ "$f" == *"$FILESTATE_JSON_PATTERN" ]]; then
       json_files+=("$f")
     else
@@ -399,7 +402,7 @@ process_zip_for_receiver_project(){
   done
 
   if [ "${#json_files[@]}" -eq 1 ] && [ "${#normal_files[@]}" -eq 0 ]; then
-    # FileState-ZIP
+    # FileState ZIP
     local json_in_zip json_dir json_file
     json_in_zip="${json_files[0]}"
     json_dir="$(dirname "$json_in_zip")"
@@ -409,40 +412,40 @@ process_zip_for_receiver_project(){
       mkdir -p "${proj_root}/${json_dir}"
     fi
 
-    log "INFO" "FileState-ZIP erkannt (nur JSON: ${json_in_zip}) - extrahiere nach ${proj_root}"
+    log "INFO" "FileState ZIP detected (only JSON: ${json_in_zip}) - extracting to ${proj_root}"
     if ! unzip -oq "$zip_path" "$json_in_zip" -d "$proj_root" 2>/dev/null; then
-      log "ERROR" "Konnte FileState-JSON nicht extrahieren: ${json_in_zip}"
+      log "ERROR" "Could not extract FileState JSON: ${json_in_zip}"
       return 1
     fi
 
     json_file="${proj_root}/${json_in_zip}"
     if ! apply_filestate_json "$json_file" "$eff_receiver" "$eff_project"; then
-      log "ERROR" "FileState-Anwendung fehlgeschlagen: ${json_file}"
+      log "ERROR" "Applying FileState JSON failed: ${json_file}"
       return 1
     fi
 
-    # FileState-JSON wieder entfernen + leere Ordner bereinigen
-    rm -f -- "$json_file" || log "WARN" "Konnte FileState-JSON nicht löschen: ${json_file}"
+    # Remove FileState JSON again and clean up empty directories
+    rm -f -- "$json_file" || log "WARN" "Could not delete FileState JSON: ${json_file}"
     cleanup_empty_dirs_under "$proj_root"
 
-    log "INFO" "FileState-ZIP erfolgreich angewendet: ${zip_path}"
+    log "INFO" "FileState ZIP successfully applied: ${zip_path}"
   else
-    # Normale Daten-ZIP → einfach entpacken
-    log "INFO" "Normales ZIP erkannt (Dateien=${#files[@]}), entpacke nach ${proj_root}"
+    # Normal data ZIP → just extract
+    log "INFO" "Normal ZIP detected (files=${#files[@]}), extracting to ${proj_root}"
     if ! unzip -oq "$zip_path" -d "$proj_root" 2>/dev/null; then
-      log "ERROR" "Entpacken fehlgeschlagen: ${zip_path}"
+      log "ERROR" "Extraction failed: ${zip_path}"
       return 1
     fi
   fi
 
-  # ZIP selbst entfernen, damit nur Inhalte übrig bleiben
-  rm -f -- "$zip_path" || log "WARN" "Konnte ZIP nicht löschen: ${zip_path}"
+  # Remove ZIP itself so that only contents remain
+  rm -f -- "$zip_path" || log "WARN" "Could not delete ZIP: ${zip_path}"
 
   return 0
 }
 
 ############################
-# Binary herunterladen
+# Download Binary into temporary ZIP
 ############################
 download_binary_to_zip(){
   local rel="$1" target_zip="$2" expected_hash="$3"
@@ -451,27 +454,27 @@ download_binary_to_zip(){
   rel="${rel#/}"
   rel_nover="$(printf '%s' "$rel" | strip_history)"
 
-  log "INFO" "lade Binary: ${rel}"
+  log "INFO" "Downloading Binary: ${rel}"
 
-  # 1) Versuche FHIR-JSON mit .data
+  # 1) Try FHIR JSON with .data
   if curl_json "${BASE}/${rel}" | jq -er '.data' 2>/dev/null | b64d > "$target_zip" 2>>"$LOG"; then
     got=1
-    log "INFO" "FHIR-JSON erfolgreich: ${rel}"
+    log "INFO" "FHIR JSON download successful: ${rel}"
   elif curl_json "${BASE}/${rel_nover}" | jq -er '.data' 2>/dev/null | b64d > "$target_zip" 2>>"$LOG"; then
     got=1
-    log "INFO" "FHIR-JSON erfolgreich (ohne _history): ${rel_nover}"
+    log "INFO" "FHIR JSON download successful (without _history): ${rel_nover}"
   fi
 
-  # 2) RAW
+  # 2) RAW download
   if [ "$got" -eq 0 ]; then
     if curl_bin "${BASE}/${rel}" -o "$target_zip" 2>>"$LOG" \
     || curl_bin "${BASE}/${rel_nover}" -o "$target_zip" 2>>"$LOG"; then
       got=1
-      log "INFO" "RAW-ZIP erfolgreich: ${rel}"
+      log "INFO" "RAW ZIP download successful: ${rel}"
     fi
   fi
 
-  # 3) History-Fallback (neueste Version)
+  # 3) History fallback (latest version)
   if [ "$got" -eq 0 ]; then
     ver="$(curl_json "${BASE}/${rel_nover}/_history" 2>>"$LOG" \
           | jq -r '.entry[]?.resource?.meta?.versionId // empty' 2>/dev/null \
@@ -481,17 +484,17 @@ download_binary_to_zip(){
       if curl_json "${BASE}/${rel_ver}" | jq -er '.data' 2>/dev/null | b64d > "$target_zip" 2>>"$LOG" \
       || curl_bin "${BASE}/${rel_ver}" -o "$target_zip" 2>>"$LOG"; then
         got=1
-        log "INFO" "Versioniertes Read erfolgreich: ${rel_ver}"
+        log "INFO" "Versioned read successful: ${rel_ver}"
       fi
     fi
   fi
 
   if [ "$got" -eq 0 ]; then
-    log "ERROR" "Download fehlgeschlagen: ${rel}"
+    log "ERROR" "Download failed: ${rel}"
     return 1
   fi
 
-  # SHA-Check (optional)
+  # SHA check (optional)
   if [ -n "$expected_hash" ]; then
     local exp act
     exp="$(printf '%s' "$expected_hash" | tr '[:upper:]' '[:lower:]')"
@@ -504,55 +507,55 @@ download_binary_to_zip(){
           log "WARN" "${RED}SHA256 MISMATCH: expected=$exp got=$act${NC}"
         fi
       else
-        log "WARN" "SHA256 konnte nicht berechnet werden (Datei=${target_zip})"
+        log "WARN" "Could not compute SHA256 (file=${target_zip})"
       fi
     else
-      log "WARN" "Kein Tool für SHA256 gefunden - Hash-Check übersprungen"
+      log "WARN" "No tool for SHA256 found - hash check skipped"
     fi
   else
-    log "INFO" "Kein expected Hash im masterIdentifier - Check übersprungen"
+    log "INFO" "No expected hash in masterIdentifier - hash check skipped"
   fi
 
   return 0
 }
 
 ############################
-# DocRef + Binary löschen (nur bei Erfolg)
+# Delete DocRef and Binary (only on success)
 ############################
 delete_doc_and_binary(){
   local dr_id="$1" rel="$2"
 
   if [ "${DELETE_AFTER_DOWNLOAD}" != "1" ]; then
-    log "INFO" "DELETE_AFTER_DOWNLOAD!=1 - FHIR-Delete übersprungen (DocRef=${dr_id})"
+    log "INFO" "DELETE_AFTER_DOWNLOAD!=1 - skipping FHIR delete (DocRef=${dr_id})"
     return 0
   fi
 
   if [ -z "$dr_id" ]; then
-    log "WARN" "Keine DocRef-ID bekannt - FHIR-Delete übersprungen"
+    log "WARN" "No DocRef ID known - skipping FHIR delete"
     return 0
   fi
 
-  # Binary-ID aus rel extrahieren
+  # Extract Binary ID from rel
   local rel_nover bid
   rel_nover="$(printf '%s' "$rel" | strip_history)"
   bid="$(printf '%s\n' "$rel_nover" | sed -nE 's#^Binary/([^/]+).*$#\1#p')"
 
-  log "INFO" "FHIR-Delete vorbereiten: DocRef=${dr_id}, Binary=${bid:-unbekannt}"
+  log "INFO" "Preparing FHIR delete: DocRef=${dr_id}, Binary=${bid:-unknown}"
 
-  # Reihenfolge: zuerst DocRef, dann Binary
-  delete_with_verify "DocumentReference" "$dr_id" || log "WARN" "DocRef-Delete fehlgeschlagen (DocRef=${dr_id})"
+  # Order: first DocumentReference, then Binary
+  delete_with_verify "DocumentReference" "$dr_id" || log "WARN" "DocRef delete failed (DocRef=${dr_id})"
   fhir_delete_history "DocumentReference" "$dr_id" || true
 
   if [ -n "$bid" ]; then
-    delete_with_verify "Binary" "$bid" || log "WARN" "Binary-Delete fehlgeschlagen (Binary=${bid})"
+    delete_with_verify "Binary" "$bid" || log "WARN" "Binary delete failed (Binary=${bid})"
     fhir_delete_history "Binary" "$bid" || true
   else
-    log "WARN" "Keine Binary-ID aus rel ableitbar - Binary-Delete übersprungen"
+    log "WARN" "Could not derive Binary ID from rel - skipping Binary delete"
   fi
 }
 
 ############################
-# Voraussetzungen prüfen
+# Check prerequisites
 ############################
 need_bin curl
 need_bin jq
@@ -563,44 +566,44 @@ need_bin unzip
 need_bin find
 
 if command -v sha256sum >/dev/null 2>&1; then
-  log "INFO" "SHA256-Prüfung via sha256sum aktiv"
+  log "INFO" "SHA256 check via sha256sum enabled"
 elif command -v shasum >/dev/null 2>&1; then
-  log "INFO" "SHA256-Prüfung via shasum aktiv"
+  log "INFO" "SHA256 check via shasum enabled"
 elif command -v openssl >/dev/null 2>&1; then
-  log "INFO" "SHA256-Prüfung via openssl aktiv"
+  log "INFO" "SHA256 check via openssl enabled"
 else
-  log "WARN" "Kein Tool für SHA256 gefunden - Hash-Check wird übersprungen"
+  log "WARN" "No tool for SHA256 found - hash check will be skipped"
 fi
 
-log "INFO" "Start; Ziel: $OUTDIR"
-log "INFO" "FHIR-Basis: $BASE"
+log "INFO" "Start; target: $OUTDIR"
+log "INFO" "FHIR base: $BASE"
 
-# Prüfen, ob OUTDIR verfügbar ist (z. B. CIFS-Mount)
+# Check if OUTDIR is available (e.g. CIFS mount)
 if [ ! -d "$OUTDIR" ]; then
-  log "ERROR" "OUTDIR nicht erreichbar: $OUTDIR - vermutlich CIFS-Mount nicht vorhanden."
+  log "ERROR" "OUTDIR not reachable: $OUTDIR - CIFS mount probably not available."
   exit 1
 fi
 
-# Prüfen, ob OUTDIR beschreibbar ist
+# Check if OUTDIR is writable
 if [ ! -w "$OUTDIR" ]; then
-  log "ERROR" "OUTDIR ist nicht beschreibbar: $OUTDIR"
+  log "ERROR" "OUTDIR is not writable: $OUTDIR"
   exit 1
 fi
 
 log "INFO" "Filter: system=$IDENT_SYSTEM | prefix=$SEARCH_PREFIX | exact=''"
 log "INFO" "DELETE_AFTER_DOWNLOAD=${DELETE_AFTER_DOWNLOAD} FILESTATE_DELETE_ENABLED=${FILESTATE_DELETE_ENABLED} FORCE_HISTORY_DELETE=${FORCE_HISTORY_DELETE}"
 
-curl_json "${BASE}/metadata" -o /dev/null || die "FHIR nicht erreichbar: ${BASE}/metadata"
-log "INFO" "FHIR erreichbar"
+curl_json "${BASE}/metadata" -o /dev/null || die "FHIR not reachable: ${BASE}/metadata"
+log "INFO" "FHIR reachable"
 
-# Capability-Check delete-history
+# Capability check: delete-history
 HAS_DELETE_HISTORY=0
 if resp="$(curl -fsS "${BASE}/metadata" 2>/dev/null | jq -r '.rest[]?.resource[]? | {t:.type, i:([.interaction[]?.code]|join(","))} | @tsv' 2>/dev/null)"; then
   if printf '%s\n' "$resp" | grep -q 'delete-history'; then
     HAS_DELETE_HISTORY=1
   fi
 fi
-log "INFO" "delete-history beworben: ${HAS_DELETE_HISTORY}"
+log "INFO" "delete-history advertised: ${HAS_DELETE_HISTORY}"
 
 ############################
 # Lock
@@ -618,21 +621,21 @@ trap cleanup_lock EXIT
 if command -v flock >/dev/null 2>&1; then
   exec 9>"$LOCK_NAME"
   if ! flock -n 9; then
-    log "WARN" "bereits laufend, Ende"
+    log "WARN" "already running, exiting"
     exit 0
   fi
-  log "INFO" "Lock via flock aktiv: $LOCK_NAME"
+  log "INFO" "Lock via flock active: $LOCK_NAME"
 else
   LOCKDIR="${LOCK_NAME}.d"
   if ! mkdir "$LOCKDIR" 2>/dev/null; then
-    log "WARN" "bereits laufend (Lockdir), Ende"
+    log "WARN" "already running (lockdir), exiting"
     exit 0
   fi
-  log "INFO" "Lock via Lockdir aktiv: $LOCKDIR"
+  log "INFO" "Lock via lock directory active: $LOCKDIR"
 fi
 
 ############################
-# Kandidaten sammeln
+# Collect candidates
 ############################
 RELS=()   # "RECEIVER|||PROJECT|||DR_ID|||REL|||HASH"
 TMP="$(mktemp_tmp)"
@@ -641,9 +644,9 @@ found_urls=0
 
 URL="${BASE}/DocumentReference?_count=${PAGE_SIZE}"
 while [ -n "$URL" ] && [ "$found_pages" -lt "$MAX_PAGES" ]; do
-  log "INFO" "DR-Seite laden: $URL"
+  log "INFO" "Loading DocumentReference page: $URL"
   if ! curl_json "$URL" -o "$TMP"; then
-    log "ERROR" "DR-Request fehlgeschlagen: $URL"
+    log "ERROR" "DocumentReference request failed: $URL"
     break
   fi
   found_pages=$((found_pages+1))
@@ -692,8 +695,8 @@ done
 rm -f "$TMP"
 
 if [ "${#RELS[@]}" -eq 0 ]; then
-  log "WARN" "keine Kandidaten gefunden (pages=${found_pages}, urls=${found_urls})"
-  log "INFO" "Fertig (nichts zu tun)"
+  log "WARN" "No candidates found (pages=${found_pages}, urls=${found_urls})"
+  log "INFO" "Done (nothing to do)"
   exit 0
 else
   deduped="$(printf '%s\n' "${RELS[@]}" | awk 'NF' | sort -u)"
@@ -701,11 +704,11 @@ else
   while IFS= read -r line; do
     [ -n "$line" ] && RELS+=("$line")
   done <<< "$deduped"
-  log "INFO" "Kandidaten gesamt (dedupliziert): ${#RELS[@]}"
+  log "INFO" "Total candidates (deduplicated): ${#RELS[@]}"
 fi
 
 ############################
-# Download + Verarbeiten + optionales FHIR-Delete
+# Download + process + optional FHIR delete
 ############################
 for entry in "${RELS[@]}"; do
   receiver="${entry%%|||*}"
@@ -721,13 +724,13 @@ for entry in "${RELS[@]}"; do
   tmpzip="$(mktemp_zip)"
 
   if ! download_binary_to_zip "$rel" "$tmpzip" "$hash"; then
-    log "ERROR" "Überspringe DocRef='${dr_id}' wegen Downloadfehler"
+    log "ERROR" "Skipping DocRef='${dr_id}' due to download error"
     rm -f "$tmpzip"
     continue
   fi
 
   if ! process_zip_for_receiver_project "$tmpzip" "$receiver" "$project"; then
-    log "ERROR" "Überspringe DocRef='${dr_id}' wegen Verarbeitungsfehler (FHIR-DELETE unterbleibt)"
+    log "ERROR" "Skipping DocRef='${dr_id}' due to processing error (FHIR delete suppressed)"
     rm -f "$tmpzip"
     continue
   fi
@@ -737,4 +740,4 @@ for entry in "${RELS[@]}"; do
   delete_doc_and_binary "$dr_id" "$rel"
 done
 
-log "INFO" "Fertig"
+log "INFO" "Done"
