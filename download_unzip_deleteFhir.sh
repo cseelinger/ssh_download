@@ -9,7 +9,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
 
 RUN_DIR="${RUN_DIR:-$SCRIPT_DIR/run}"
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
-OUTDIR="${OUTDIR:-/mnt/OE0600-Projekte/MIC}"
+OUTDIR="${OUTDIR:-/mnt/OE0600-Projekte/}"
+OUTDIR_ROBIN="${OUTDIR_ROBIN:-/mnt/OE0600-Projekte/MIC}"
 TMP_DIR="${TMP_DIR:-$SCRIPT_DIR/tmp}"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR" "$TMP_DIR"
@@ -130,6 +131,19 @@ strip_history(){
 
 safe_name(){
   tr -cd 'A-Za-z0-9._-'
+}
+
+# Choose output directory depending on receiver:
+# - "Robin" → OUTDIR_ROBIN
+# - everything else → OUTDIR
+outdir_for_receiver(){
+  local receiver_lower
+  receiver_lower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  if [ "$receiver_lower" = "robin" ]; then
+    printf '%s\n' "$OUTDIR_ROBIN"
+  else
+    printf '%s\n' "$OUTDIR"
+  fi
 }
 
 compute_sha256(){
@@ -286,11 +300,12 @@ apply_filestate_json(){
   [ -z "$eff_project" ] && eff_project="UNKNOWN_PROJECT"
   [ -z "$eff_receiver" ] && eff_receiver="DKFZ"
 
-  local safe_proj safe_recv proj_root
+  local safe_proj safe_recv proj_root base_outdir
   safe_proj="$(printf '%s' "$eff_project" | safe_name)"; [ -z "$safe_proj" ] && safe_proj="UNKNOWN_PROJECT"
   safe_recv="$(printf '%s' "$eff_receiver" | safe_name)"; [ -z "$safe_recv" ] && safe_recv="UNKNOWN_RECEIVER"
 
-  proj_root="${OUTDIR}/${safe_recv}/${safe_proj}"
+  base_outdir="$(outdir_for_receiver "$eff_receiver")"
+  proj_root="${base_outdir}/${safe_recv}/${safe_proj}"
   mkdir -p "$proj_root"
 
   log "INFO" "FILESTATE: apply for receiver='${eff_receiver}' project='${eff_project}' proj_root='${proj_root}'"
@@ -363,11 +378,12 @@ process_zip_for_receiver_project(){
   [ -z "$eff_receiver" ] && eff_receiver="DKFZ"
   [ -z "$eff_project" ] && eff_project="UNKNOWN_PROJECT"
 
-  local safe_recv safe_proj proj_root
+  local safe_recv safe_proj proj_root base_outdir
   safe_recv="$(printf '%s' "$eff_receiver" | safe_name)"; [ -z "$safe_recv" ] && safe_recv="UNKNOWN_RECEIVER"
   safe_proj="$(printf '%s' "$eff_project" | safe_name)"; [ -z "$safe_proj" ] && safe_proj="UNKNOWN_PROJECT"
 
-  proj_root="${OUTDIR}/${safe_recv}/${safe_proj}"
+  base_outdir="$(outdir_for_receiver "$eff_receiver")"
+  proj_root="${base_outdir}/${safe_recv}/${safe_proj}"
   mkdir -p "$proj_root"
 
   log "INFO" "Processing ZIP: zip='${zip_path}' → receiver='${eff_receiver}' project='${eff_project}' proj_root='${proj_root}'"
@@ -575,7 +591,7 @@ else
   log "WARN" "No tool for SHA256 found - hash check will be skipped"
 fi
 
-log "INFO" "Start; target: $OUTDIR"
+log "INFO" "Start; targets: OUTDIR=$OUTDIR OUTDIR_ROBIN=$OUTDIR_ROBIN"
 log "INFO" "FHIR base: $BASE"
 
 # Check if OUTDIR is available (e.g. CIFS mount)
@@ -587,6 +603,18 @@ fi
 # Check if OUTDIR is writable
 if [ ! -w "$OUTDIR" ]; then
   log "ERROR" "OUTDIR is not writable: $OUTDIR"
+  exit 1
+fi
+
+# Check if OUTDIR_ROBIN is available (e.g. CIFS mount)
+if [ ! -d "$OUTDIR_ROBIN" ]; then
+  log "ERROR" "OUTDIR_ROBIN not reachable: $OUTDIR_ROBIN - CIFS mount probably not available."
+  exit 1
+fi
+
+# Check if OUTDIR_ROBIN is writable
+if [ ! -w "$OUTDIR_ROBIN" ]; then
+  log "ERROR" "OUTDIR_ROBIN is not writable: $OUTDIR_ROBIN"
   exit 1
 fi
 
