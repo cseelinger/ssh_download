@@ -1,4 +1,4 @@
-# README — FHIR ZIP downloader + extractor + optional FHIR cleanup
+# FHIR ZIP downloader + extractor + optional FHIR cleanup
 
 This Bash script polls a FHIR server for `DocumentReference` resources whose `masterIdentifier.value` starts with a configurable prefix, downloads the referenced `Binary` payload (expected to be a ZIP), extracts its contents into a receiver/project folder structure, optionally applies **FileState delete logic**, and (if enabled) deletes the processed `DocumentReference` + `Binary` from the FHIR server **only after successful processing**.
 
