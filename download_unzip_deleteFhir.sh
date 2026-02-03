@@ -9,8 +9,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
 
 RUN_DIR="${RUN_DIR:-$SCRIPT_DIR/run}"
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
-OUTDIR="${OUTDIR:-/mnt/OE0600-Projekte/}"
-OUTDIR_ROBIN="${OUTDIR_ROBIN:-/mnt/OE0600-Projekte/MIC}"
+OUTDIR="${OUTDIR:-/mnt/default-folder/}"
+OUTDIR_NAME="${OUTDIR_NAME:-/mnt/default-folder/target}"
 TMP_DIR="${TMP_DIR:-$SCRIPT_DIR/tmp}"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR" "$TMP_DIR"
@@ -68,7 +68,7 @@ MAX_PAGES="${MAX_PAGES:-50}"
 PAGE_SIZE="${PAGE_SIZE:-200}"
 
 # Delete in FHIR after successful processing?
-: "${DELETE_AFTER_DOWNLOAD:=1}"
+: "${DELETE_AFTER_DOWNLOAD:=0}"
 # Force delete-history even if capability is not advertised
 : "${FORCE_HISTORY_DELETE:=1}"
 # Apply FileState delete logic?
@@ -134,13 +134,13 @@ safe_name(){
 }
 
 # Choose output directory depending on receiver:
-# - "Robin" → OUTDIR_ROBIN
+# - "Name" → OUTDIR_NAME
 # - everything else → OUTDIR
 outdir_for_receiver(){
   local receiver_lower
   receiver_lower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   if [ "$receiver_lower" = "robin" ]; then
-    printf '%s\n' "$OUTDIR_ROBIN"
+    printf '%s\n' "$OUTDIR_NAME"
   else
     printf '%s\n' "$OUTDIR"
   fi
@@ -591,7 +591,7 @@ else
   log "WARN" "No tool for SHA256 found - hash check will be skipped"
 fi
 
-log "INFO" "Start; targets: OUTDIR=$OUTDIR OUTDIR_ROBIN=$OUTDIR_ROBIN"
+log "INFO" "Start; targets: OUTDIR=$OUTDIR OUTDIR_NAME=$OUTDIR_NAME"
 log "INFO" "FHIR base: $BASE"
 
 # Check if OUTDIR is available (e.g. CIFS mount)
@@ -606,15 +606,15 @@ if [ ! -w "$OUTDIR" ]; then
   exit 1
 fi
 
-# Check if OUTDIR_ROBIN is available (e.g. CIFS mount)
-if [ ! -d "$OUTDIR_ROBIN" ]; then
-  log "ERROR" "OUTDIR_ROBIN not reachable: $OUTDIR_ROBIN - CIFS mount probably not available."
+# Check if OUTDIR_NAME is available (e.g. CIFS mount)
+if [ ! -d "$OUTDIR_NAME" ]; then
+  log "ERROR" "OUTDIR_NAME not reachable: $OUTDIR_NAME - CIFS mount probably not available."
   exit 1
 fi
 
-# Check if OUTDIR_ROBIN is writable
-if [ ! -w "$OUTDIR_ROBIN" ]; then
-  log "ERROR" "OUTDIR_ROBIN is not writable: $OUTDIR_ROBIN"
+# Check if OUTDIR_NAME is writable
+if [ ! -w "$OUTDIR_NAME" ]; then
+  log "ERROR" "OUTDIR_NAME is not writable: $OUTDIR_NAME"
   exit 1
 fi
 
